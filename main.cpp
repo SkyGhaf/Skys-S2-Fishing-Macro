@@ -134,6 +134,7 @@ struct Telemetry {
     float waitForFishRemainingMs = 0.0f;
     int catchesSinceRespawn = 0;
     int totalCatches = 0;
+    int zonePct = -1; // share of this minigame's frames with the block inside the zone
     int confidence = 0;
     ControlState state = ControlState::Paused;
     Phase phase = Phase::Cast;
@@ -143,6 +144,8 @@ std::atomic<bool> gQuit{false};
 std::atomic<bool> gEnabled{false};
 std::atomic<ULONGLONG> gWaitForFishMs{kDefaultWaitForFishMs};
 std::atomic<bool> gAutoRespawn{false};
+// Setup tab toggle: write one CSV per minigame into logs\ for tuning.
+std::atomic<bool> gMinigameLog{false};
 std::atomic<ULONGLONG> gCollectDelayMs{kDefaultCollectDelayMs};
 // Pressed once, quickly, every time the macro is started: the correction
 // key first, then the rod key (re-equips the rod).
@@ -763,6 +766,77 @@ void FindBarObjects(const CaptureSurface& surface, Detection& target,
     player = StrongestRun(white, std::max(3, surface.width * 7 / 100), 4);
 }
 
+// Millisecond clock with sub-millisecond resolution. GetTickCount64 only
+// advances in ~15.6 ms steps, so loop timing, velocities and the PWM phase
+// computed from it were mostly 0 (clamped to 1 ms) with an occasional 16 ms
+// jump - and the FPS shown in the HUD was wrong for the same reason.
+double PreciseMs() {
+    static const double ticksPerMs = [] {
+        LARGE_INTEGER f;
+        QueryPerformanceFrequency(&f);
+        return static_cast<double>(f.QuadPart) / 1000.0;
+    }();
+    LARGE_INTEGER c;
+    QueryPerformanceCounter(&c);
+    return static_cast<double>(c.QuadPart) / ticksPerMs;
+}
+
+// Cheap fingerprint of the captured bar. The loop scans far faster than the
+// game redraws (60-144 Hz), so most scans see an identical image; velocities
+// must only be measured between frames that actually changed.
+uint64_t FrameSignature(const CaptureSurface& surface) {
+    uint64_t hash = 1469598103934665603ULL;
+    const int total = surface.width * surface.height;
+    for (int i = 0; i < total; i += 3) {
+        hash ^= surface.pixels[i];
+        hash *= 1099511628211ULL;
+    }
+    return hash;
+}
+
+// One CSV per minigame (Setup tab -> Minigame log), for tuning the control.
+struct MinigameLog {
+    FILE* file = nullptr;
+    double startMs = 0.0;
+
+    void Open() {
+        wchar_t modulePath[MAX_PATH];
+        const DWORD len = GetModuleFileNameW(nullptr, modulePath, MAX_PATH);
+        std::wstring dir(modulePath, (len > 0 && len < MAX_PATH) ? len : 0);
+        dir = dir.substr(0, dir.find_last_of(L"\\/") + 1) + L"logs";
+        CreateDirectoryW(dir.c_str(), nullptr);
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        wchar_t name[64];
+        swprintf_s(name, L"\\minigame_%04u%02u%02u_%02u%02u%02u.csv",
+                   st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond);
+        file = _wfopen((dir + name).c_str(), L"w");
+        if (!file) return;
+        setvbuf(file, nullptr, _IOFBF, 1 << 16);
+        fprintf(file, "ms,exit,t_top,t_bottom,t_center,p_top,p_bottom,p_center,"
+                      "t_vel,p_vel,error,duty,mouse\n");
+        startMs = PreciseMs();
+    }
+
+    void Row(double nowMs, bool exitVisible, const Detection& t, const Detection& pl,
+             float tVel, float pVel, float error, float duty, bool mouse) {
+        if (!file) return;
+        fprintf(file, "%.1f,%d,%d,%d,%.1f,%d,%d,%.1f,%.4f,%.4f,%.1f,%.2f,%d\n",
+                nowMs - startMs, exitVisible ? 1 : 0,
+                t.found ? t.top : -1, t.found ? t.bottom : -1, t.found ? t.center : -1.0f,
+                pl.found ? pl.top : -1, pl.found ? pl.bottom : -1, pl.found ? pl.center : -1.0f,
+                tVel, pVel, error, duty, mouse ? 1 : 0);
+    }
+
+    void Close(int frames, int inZone) {
+        if (!file) return;
+        fprintf(file, "# frames=%d in_zone=%d (%.1f%%) duration_ms=%.0f\n", frames, inZone,
+                frames ? inZone * 100.0 / frames : 0.0, PreciseMs() - startMs);
+        fclose(file);
+        file = nullptr;
+    }
+};
+
 DWORD WINAPI TrackerThread(void*) {
     timeBeginPeriod(1);
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
@@ -786,9 +860,17 @@ DWORD WINAPI TrackerThread(void*) {
     float previousTarget = 0.0f;
     float targetVelocity = 0.0f;
     double pwmPhaseMs = 0.0;
-    ULONGLONG previousTick = GetTickCount64();
+    double previousMs = PreciseMs();
     ULONGLONG lastUiTick = 0;
-    ULONGLONG holdStarted = 0;
+    double holdStartedMs = 0.0;
+    // Frame-change tracking for velocity (see FrameSignature).
+    uint64_t lastSignature = 0;
+    double lastChangeMs = 0.0;
+    // Per-minigame stats + optional CSV log.
+    bool hookActive = false;
+    int hookFrames = 0;
+    int hookInZone = 0;
+    MinigameLog minigameLog;
     int missingFrames = 0;
     float fpsAverage = 0.0f;
 
@@ -796,7 +878,7 @@ DWORD WINAPI TrackerThread(void*) {
         if (mouseDown != down) {
             MouseButton(down);
             mouseDown = down;
-            if (down) holdStarted = GetTickCount64();
+            if (down) holdStartedMs = PreciseMs();
         }
     };
 
@@ -814,9 +896,10 @@ DWORD WINAPI TrackerThread(void*) {
     bool wasRunning = false; // to press the equip keys once per Start
 
     while (!gQuit.load()) {
-        const ULONGLONG now = GetTickCount64();
-        const double dtMs = std::clamp<double>(now - previousTick, 1.0, 30.0);
-        previousTick = now;
+        const ULONGLONG now = GetTickCount64(); // coarse; fine for the phase timers
+        const double nowMs = PreciseMs();
+        const double dtMs = std::clamp(nowMs - previousMs, 0.05, 30.0);
+        previousMs = nowMs;
         const float instantFps = static_cast<float>(1000.0 / dtMs);
         fpsAverage += (instantFps - fpsAverage) * 0.08f;
 
@@ -875,6 +958,10 @@ DWORD WINAPI TrackerThread(void*) {
             catchesSinceRespawn = 0;
             missedCastsInARow = 0;
             wasRunning = false;
+            if (hookActive) {
+                minigameLog.Close(hookFrames, hookInZone);
+                hookActive = false;
+            }
             current.phase = phase;
             current.mouseDown = mouseDown;
             {
@@ -892,7 +979,7 @@ DWORD WINAPI TrackerThread(void*) {
         if (!wasRunning) {
             wasRunning = true;
             EquipRodOnStart();
-            previousTick = GetTickCount64();
+            previousMs = PreciseMs();
         }
 
         current.phase = phase;
@@ -986,7 +1073,18 @@ DWORD WINAPI TrackerThread(void*) {
         } else if (phase == Phase::Hook) {
             const bool exitVisible = ExitVisible(exitSurface, exitRect.left, exitRect.top);
             Detection target{}, player{};
-            if (barSurface.Grab(bar.left, bar.top)) FindBarObjects(barSurface, target, player);
+            bool frameChanged = false;
+            if (barSurface.Grab(bar.left, bar.top)) {
+                FindBarObjects(barSurface, target, player);
+                const uint64_t signature = FrameSignature(barSurface);
+                frameChanged = signature != lastSignature;
+                lastSignature = signature;
+            }
+            if (!hookActive) {
+                hookActive = true;
+                hookFrames = hookInZone = 0;
+                if (gMinigameLog.load()) minigameLog.Open();
+            }
             if (exitVisible) {
                 if (!sawExitDuringHook) {
                     // First sighting of the exit bar this cycle: the click is
@@ -1025,33 +1123,46 @@ DWORD WINAPI TrackerThread(void*) {
                 if (missingFrames <= 2) {
                     setMouse(mouseDown);
                 } else {
-                    const bool recoveryPulse = ((now / 18) % 3) != 2;
+                    const bool recoveryPulse = (static_cast<ULONGLONG>(nowMs / 18.0) % 3) != 2;
                     setMouse(recoveryPulse);
                     current.state = recoveryPulse ? ControlState::Holding : ControlState::Releasing;
                 }
             } else {
                 missingFrames = 0;
-                const float alpha = 0.34f;
-                const float rawPlayerVelocity = hadPlayer
-                    ? (player.center - previousPlayer) / static_cast<float>(dtMs) : 0.0f;
-                const float rawTargetVelocity = hadPlayer
-                    ? (target.center - previousTarget) / static_cast<float>(dtMs) : 0.0f;
-                playerVelocity += (rawPlayerVelocity - playerVelocity) * alpha;
-                targetVelocity += (rawTargetVelocity - targetVelocity) * 0.28f;
-                previousPlayer = player.center;
-                previousTarget = target.center;
-                hadPlayer = true;
+                // Velocities (px/ms) are only measured between frames the game
+                // actually redrew, over the real time between them.
+                if (!hadPlayer) {
+                    previousPlayer = player.center;
+                    previousTarget = target.center;
+                    lastChangeMs = nowMs;
+                    playerVelocity = targetVelocity = 0.0f;
+                    hadPlayer = true;
+                } else if (frameChanged) {
+                    const float frameDt = static_cast<float>(std::clamp(nowMs - lastChangeMs, 4.0, 100.0));
+                    const float rawPlayerVelocity = (player.center - previousPlayer) / frameDt;
+                    const float rawTargetVelocity = (target.center - previousTarget) / frameDt;
+                    playerVelocity += (rawPlayerVelocity - playerVelocity) * 0.5f;
+                    targetVelocity += (rawTargetVelocity - targetVelocity) * 0.4f;
+                    previousPlayer = player.center;
+                    previousTarget = target.center;
+                    lastChangeMs = nowMs;
+                }
 
-                // Predict 14 ms ahead so the player block brakes before crossing a moving zone.
-                const float desired = std::clamp(target.center + targetVelocity * 14.0f,
+                // Look ahead roughly the click -> game -> screen latency (a few
+                // frames), for both the zone and the block, so the block brakes
+                // before it overshoots instead of reacting after the fact.
+                constexpr float kPredictMs = 50.0f;
+                const float desired = std::clamp(target.center + targetVelocity * kPredictMs,
                                                  static_cast<float>(target.top + 2),
                                                  static_cast<float>(target.bottom - 2));
-                const float error = player.center - desired; // positive = player is below target
+                const float predictedPlayer = player.center + playerVelocity * kPredictMs;
+                const float error = predictedPlayer - desired; // positive = block will be below target
                 const float relativeVelocity = playerVelocity - targetVelocity;
                 current.error = error;
                 const float targetHalf = std::max(6.0f, (target.bottom - target.top + 1) * 0.5f);
                 const float safeHalf = std::max(3.0f, targetHalf -
                     std::max(3.0f, (player.bottom - player.top + 1) * 0.45f));
+                float duty = -1.0f; // -1 = not in the PWM band (logged)
                 const bool nearTop = player.top <= 3;
                 const bool nearBottom = player.bottom >= barSurface.height - 4;
 
@@ -1069,11 +1180,15 @@ DWORD WINAPI TrackerThread(void*) {
                     commandDown = false;
                     current.state = ControlState::Releasing;
                 } else {
-                    // Binary PID converted to 18 ms PWM. The 0.52 hover term is
-                    // continuously corrected by position and vertical momentum.
-                    float duty = 0.52f + 0.070f * error + 0.095f * relativeVelocity;
-                    if (error > 0.0f) duty += 0.035f;
-                    if (error < 0.0f) duty -= 0.035f;
+                    // Binary PID converted to 18 ms PWM around a 0.52 hover duty.
+                    // Gains are relative to the zone / bar size instead of raw
+                    // pixels: 0.07 per pixel saturated after ~5 px on a 500 px
+                    // bar, so this was effectively bang-bang, and its strength
+                    // depended on the screen resolution.
+                    const float errorNorm = error / safeHalf; // -0.8 .. 0.8 here
+                    const float velocityNorm = relativeVelocity * 1000.0f /
+                        static_cast<float>(std::max(1, barSurface.height)); // bar heights per second
+                    duty = 0.52f + 0.30f * errorNorm + 0.06f * velocityNorm;
                     duty = std::clamp(duty, 0.08f, 0.92f);
                     constexpr double periodMs = 18.0;
                     pwmPhaseMs = std::fmod(pwmPhaseMs + dtMs, periodMs);
@@ -1083,18 +1198,28 @@ DWORD WINAPI TrackerThread(void*) {
 
                 // Safety release: long rises get a tiny braking gap, preventing a
                 // lost frame from pinning the block at the top.
-                if (commandDown && mouseDown && now - holdStarted >= 135) {
+                if (commandDown && mouseDown && nowMs - holdStartedMs >= 135.0) {
                     commandDown = false;
                     pwmPhaseMs = 16.0;
                 }
                 setMouse(commandDown);
+
+                if (frameChanged) {
+                    ++hookFrames;
+                    if (player.center >= target.top && player.center <= target.bottom) ++hookInZone;
+                    minigameLog.Row(nowMs, exitVisible, target, player, targetVelocity,
+                                    playerVelocity, error, duty, commandDown);
+                }
             }
+            current.zonePct = hookFrames ? hookInZone * 100 / hookFrames : -1;
 
             if (sawExitDuringHook && now - hookLastSeenAt >= kHookGoneDebounceMs) {
                 // The exit bar has reliably disappeared (not just one flickered
                 // frame) - that marks the end of hooking; wait out the collect
                 // delay before the hold-key press.
                 setMouse(false);
+                minigameLog.Close(hookFrames, hookInZone);
+                hookActive = false;
                 phase = Phase::Collect;
                 current.phase = phase;
                 phaseChangedAt = now;
@@ -1172,6 +1297,7 @@ DWORD WINAPI TrackerThread(void*) {
 
     setMouse(false);
     if (keyDown) KeyEvent(false, kHoldKeyVk);
+    if (hookActive) minigameLog.Close(hookFrames, hookInZone);
     timeEndPeriod(1);
     return 0;
 }
@@ -1216,7 +1342,7 @@ enum HitId {
     kHitTab0 = 1, kHitTab1, kHitTab2,
     kHitStart = 10, kHitExit, kHitClose, kHitRespawnToggle, kHitMinimize,
     kHitBindToggle = 20, kHitBindQuit, kHitBindCorrection, kHitBindRod,
-    kHitCalCast = 30, kHitCalBar, kHitCalExit,
+    kHitCalCast = 30, kHitCalBar, kHitCalExit, kHitLogToggle,
 };
 struct HitRegion {
     RECT rect;
@@ -1375,8 +1501,7 @@ void DrawFishingTab(Gdiplus::Graphics& g, const Telemetry& t) {
         if (t.phase == Phase::Hook && t.minigame) headColor = ui::kGradA;
         if (t.phase == Phase::Hook) {
             if (t.targetFound && t.playerFound) {
-                swprintf_s(line, L"Target %.0f  ·  Player %.0f  ·  Error %+.0f px",
-                           t.targetY, t.playerY, t.error);
+                swprintf_s(line, L"In zone %d%%  \u00B7  Error %+.0f px", std::max(0, t.zonePct), t.error);
             } else {
                 swprintf_s(line, L"Target %s  ·  Player %s",
                            t.targetFound ? L"found" : L"---", t.playerFound ? L"found" : L"---");
@@ -1484,7 +1609,7 @@ void DrawFishingTab(Gdiplus::Graphics& g, const Telemetry& t) {
                    RectF(18, 578, 344, 18));
     } else {
         const POINT cast = GetCastPoint();
-        swprintf_s(line, L"Cast point (%ld, %ld)  \u00B7  v2.1", cast.x, cast.y);
+        swprintf_s(line, L"Cast point (%ld, %ld)  \u00B7  v2.2", cast.x, cast.y);
         TextCenter(g, line, gFontSmall, ui::kMuted, RectF(18, 578, 344, 18));
     }
 }
@@ -1568,6 +1693,20 @@ void DrawSetupTab(Gdiplus::Graphics& g) {
     else swprintf_s(line, L"NOT SET");
     DrawCalibrationRow(g, 382, L"Exit button", line, exitSet, kHitCalExit,
                        calibrating && gCalibrationTarget == CalibrationTarget::ExitRegion);
+
+    // Minigame log toggle.
+    DrawCard(g, RectF(18, 466, 344, 70));
+    RowLabel(g, 480, L"Minigame log", L"CSV per minigame in logs\\ (for tuning)");
+    {
+        const RectF track(300, 489, 46, 24);
+        const bool on = gMinigameLog.load();
+        if (on) FillGradient(g, track, 12.0f);
+        else FillInset(g, track, 12.0f);
+        Gdiplus::SolidBrush knob(on ? ui::kText : ui::kMuted);
+        g.FillEllipse(&knob, RectF(on ? 325.0f : 303.0f, 492.0f, 18.0f, 18.0f));
+        HoverOverlay(g, RectF(296, 485, 54, 32), 14.0f, kHitLogToggle);
+        AddHit(RectF(262, 476, 94, 50), kHitLogToggle);
+    }
 }
 
 void PaintHud(HWND hwnd) {
@@ -1842,6 +1981,7 @@ void LoadSettings() {
         static_cast<ULONGLONG>(GetPrivateProfileIntW(L"Fishing", L"CollectDelaySeconds",
             static_cast<UINT>(kDefaultCollectDelayMs / 1000), path.c_str())) * 1000ULL,
         kMaxCollectDelayMs));
+    gMinigameLog.store(GetPrivateProfileIntW(L"Debug", L"MinigameLog", 0, path.c_str()) != 0);
     const UINT correctionVk = GetPrivateProfileIntW(L"Keys", L"CorrectionVk", '1', path.c_str());
     const UINT rodVk = GetPrivateProfileIntW(L"Keys", L"RodVk", '5', path.c_str());
     if (correctionVk > 0 && correctionVk <= 0xFF) gCorrectionKeyVk.store(static_cast<WORD>(correctionVk));
@@ -1883,6 +2023,7 @@ void SaveSettings() {
     WriteIntSetting(L"Fishing", L"AutoRespawn", gAutoRespawn.load() ? 1 : 0, path);
     WriteIntSetting(L"Fishing", L"RespawnEveryCatches", gRespawnEveryCatches.load(), path);
     WriteIntSetting(L"Fishing", L"CollectDelaySeconds", static_cast<int>(gCollectDelayMs.load() / 1000), path);
+    WriteIntSetting(L"Debug", L"MinigameLog", gMinigameLog.load() ? 1 : 0, path);
     WriteIntSetting(L"Keys", L"CorrectionVk", gCorrectionKeyVk.load(), path);
     WriteIntSetting(L"Keys", L"RodVk", gRodKeyVk.load(), path);
 
@@ -2038,6 +2179,10 @@ void HandleHit(HWND hwnd, int id) {
         case kHitExit:
         case kHitClose:
             PostMessage(hwnd, WM_CLOSE, 0, 0);
+            break;
+        case kHitLogToggle:
+            gMinigameLog.store(!gMinigameLog.load());
+            SaveSettings();
             break;
         case kHitRespawnToggle:
             gAutoRespawn.store(!gAutoRespawn.load());

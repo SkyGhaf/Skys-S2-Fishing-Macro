@@ -5,3 +5,4 @@
 
 # Personal settings / screen calibration (created next to the exe on first run)
 *.ini
+logs/

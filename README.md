@@ -21,6 +21,8 @@ on your own screen, so it runs at any resolution.
   (default 4).
 - **Minimize:** use the `–` button in the header. The macro keeps running, and you can bring it
   back from the taskbar.
+- **Minigame log (Setup tab):** writes one CSV per minigame to `logs\` (zone, block, velocities,
+  control output, time in zone) for tuning. Off by default.
 - **Safe focus handling:** clicks and keys are only sent when the Roblox window is really in
   front, so nothing gets typed into other windows.
 - **Settings are saved** to `SkysS2FishingMacro.ini` next to the exe (hotkeys, wait time,
