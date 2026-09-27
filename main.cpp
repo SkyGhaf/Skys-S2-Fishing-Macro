@@ -935,7 +935,8 @@ DWORD WINAPI TrackerThread(void*) {
         current.fps = fpsAverage;
         current.captureReady = captureReady;
         current.totalCatches = totalCatches;
-        current.state = current.enabled ? ControlState::Waiting : ControlState::Paused;
+        current.catchesSinceRespawn = catchesSinceRespawn; // also shown while paused
+        current.state =current.enabled ? ControlState::Waiting : ControlState::Paused;
 
         if (!current.enabled || !captureReady) {
             // Disabled (or capture unavailable): release everything and reset
@@ -955,7 +956,8 @@ DWORD WINAPI TrackerThread(void*) {
             pwmPhaseMs = 0.0;
             phaseChangedAt = now;
             lastCastConfirmedAt = 0; // a fresh Start shouldn't inherit a cooldown from before the pause
-            catchesSinceRespawn = 0;
+            // catchesSinceRespawn is deliberately kept: the drift from those
+            // catches is still there after a pause, so the reset stays due.
             missedCastsInARow = 0;
             wasRunning = false;
             if (hookActive) {
