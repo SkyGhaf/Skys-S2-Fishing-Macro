@@ -47,6 +47,7 @@ constexpr int ID_CALIBRATE_BAR = 1008;
 constexpr int ID_CALIBRATE_EXIT = 1009;
 constexpr int ID_RESPAWN_CHECK = 1010;
 constexpr int ID_RESPAWN_EDIT = 1011;
+constexpr int ID_COLLECT_EDIT = 1012;
 constexpr int HOTKEY_TOGGLE = 1;
 constexpr int HOTKEY_QUIT = 2;
 // Shared by both "Calibrate Start Point" and the hotkey binder: whichever
@@ -68,7 +69,9 @@ enum class ControlState { Waiting, Holding, Releasing, Floating, Paused };
 //   HoldKey -> holds the T key to collect/confirm, then loops back to Cast
 enum class Phase { Cast, Hook, Collect, HoldKey, WaitForFish, Respawn };
 
-constexpr ULONGLONG kCollectDelayMs = 4000;
+// Pause between the minigame ending and holding T to collect (user setting).
+constexpr ULONGLONG kDefaultCollectDelayMs = 4000;
+constexpr ULONGLONG kMaxCollectDelayMs = 30000;
 constexpr ULONGLONG kHoldKeyDurationMs = 4000;
 // Auto reposition (set respawn): every N catches the character is reset with
 // Esc -> R -> Enter, which puts it back on its spawn point and undoes the
@@ -140,6 +143,11 @@ std::atomic<bool> gQuit{false};
 std::atomic<bool> gEnabled{false};
 std::atomic<ULONGLONG> gWaitForFishMs{kDefaultWaitForFishMs};
 std::atomic<bool> gAutoRespawn{false};
+std::atomic<ULONGLONG> gCollectDelayMs{kDefaultCollectDelayMs};
+// Pressed once, quickly, every time the macro is started: the correction
+// key first, then the rod key (re-equips the rod).
+std::atomic<WORD> gCorrectionKeyVk{static_cast<WORD>('1')};
+std::atomic<WORD> gRodKeyVk{static_cast<WORD>('5')};
 std::atomic<int> gRespawnEveryCatches{kDefaultRespawnEveryCatches};
 std::mutex gTelemetryMutex;
 Telemetry gTelemetry;
@@ -148,6 +156,7 @@ HWND gToggleButton = nullptr;
 HWND gExitButton = nullptr;
 HWND gWaitFishEdit = nullptr;
 HWND gRespawnEdit = nullptr;
+HWND gCollectEdit = nullptr;
 HWND gCalibrateButton = nullptr;
 HWND gCalibrateBarButton = nullptr;
 HWND gCalibrateExitButton = nullptr;
@@ -517,6 +526,18 @@ void TapKey(WORD vk) {
     KeyEvent(false, vk);
 }
 
+// On Start: tap the correction key, then the rod key, quickly - only while
+// the game is really in front so the keys never go to another window.
+void EquipRodOnStart() {
+    if (!FocusGame()) return;
+    const HWND game = GameWindow();
+    TapKey(gCorrectionKeyVk.load());
+    InterruptibleSleep(80);
+    if (GetForegroundWindow() != game) return;
+    TapKey(gRodKeyVk.load());
+    InterruptibleSleep(250);
+}
+
 // Roblox reset: Esc opens the menu, R picks "Reset Character", Enter confirms.
 // Checks before every key that the game is still in front, so these keys can
 // never end up typed into another window. Returns false if it had to stop.
@@ -790,6 +811,7 @@ DWORD WINAPI TrackerThread(void*) {
     int catchesSinceRespawn = 0;
     int missedCastsInARow = 0;
     int totalCatches = 0; // whole session, survives pausing
+    bool wasRunning = false; // to press the equip keys once per Start
 
     while (!gQuit.load()) {
         const ULONGLONG now = GetTickCount64();
@@ -852,6 +874,7 @@ DWORD WINAPI TrackerThread(void*) {
             lastCastConfirmedAt = 0; // a fresh Start shouldn't inherit a cooldown from before the pause
             catchesSinceRespawn = 0;
             missedCastsInARow = 0;
+            wasRunning = false;
             current.phase = phase;
             current.mouseDown = mouseDown;
             {
@@ -864,6 +887,12 @@ DWORD WINAPI TrackerThread(void*) {
             }
             Sleep(2);
             continue;
+        }
+
+        if (!wasRunning) {
+            wasRunning = true;
+            EquipRodOnStart();
+            previousTick = GetTickCount64();
         }
 
         current.phase = phase;
@@ -1073,7 +1102,7 @@ DWORD WINAPI TrackerThread(void*) {
         } else if (phase == Phase::Collect) {
             setMouse(false);
             current.phaseElapsedMs = static_cast<float>(now - phaseChangedAt);
-            if (now - phaseChangedAt >= kCollectDelayMs) {
+            if (now - phaseChangedAt >= gCollectDelayMs.load()) {
                 phase = Phase::HoldKey;
                 current.phase = phase;
                 phaseChangedAt = now;
@@ -1168,7 +1197,7 @@ constexpr COLORREF kBgRef = RGB(40, 41, 70);
 constexpr COLORREF kInsetRef = RGB(32, 33, 57);
 constexpr COLORREF kTextRef = RGB(240, 242, 255);
 constexpr int kWidth = 380;
-constexpr int kHeight = 584;
+constexpr int kHeight = 612;
 constexpr int kHeaderHeight = 64;
 } // namespace ui
 
@@ -1185,8 +1214,8 @@ HBRUSH gInputBrush = nullptr;
 enum HitId {
     kHitNone = 0,
     kHitTab0 = 1, kHitTab1, kHitTab2,
-    kHitStart = 10, kHitExit, kHitClose, kHitRespawnToggle,
-    kHitBindToggle = 20, kHitBindQuit,
+    kHitStart = 10, kHitExit, kHitClose, kHitRespawnToggle, kHitMinimize,
+    kHitBindToggle = 20, kHitBindQuit, kHitBindCorrection, kHitBindRod,
     kHitCalCast = 30, kHitCalBar, kHitCalExit,
 };
 struct HitRegion {
@@ -1354,7 +1383,7 @@ void DrawFishingTab(Gdiplus::Graphics& g, const Telemetry& t) {
             }
         } else if (t.phase == Phase::Collect) {
             swprintf_s(line, L"Waiting to collect  %.1fs / %.0fs",
-                       t.phaseElapsedMs / 1000.0f, kCollectDelayMs / 1000.0f);
+                       t.phaseElapsedMs / 1000.0f, gCollectDelayMs.load() / 1000.0f);
         } else if (t.phase == Phase::HoldKey) {
             swprintf_s(line, L"Holding T  %.1fs / %.0fs",
                        t.phaseElapsedMs / 1000.0f, kHoldKeyDurationMs / 1000.0f);
@@ -1392,57 +1421,58 @@ void DrawFishingTab(Gdiplus::Graphics& g, const Telemetry& t) {
     }
 
     // --- Stat tiles --------------------------------------------------------
-    DrawCard(g, RectF(18, 234, 166, 86));
-    Text(g, L"CATCHES", gFontLabel, ui::kText, RectF(32, 246, 120, 16));
-    Text(g, L"this session", gFontSmall, ui::kMuted, RectF(32, 262, 120, 14));
+    DrawCard(g, RectF(18, 234, 166, 76));
+    Text(g, L"CATCHES", gFontLabel, ui::kText, RectF(32, 244, 120, 16));
+    Text(g, L"this session", gFontSmall, ui::kMuted, RectF(32, 259, 120, 14));
     swprintf_s(line, L"%d", t.totalCatches);
-    Text(g, line, gFontBig, ui::kText, RectF(30, 280, 130, 32));
-    FillGradient(g, RectF(164, 252, 4, 50), 2.0f, true);
+    Text(g, line, gFontBig, ui::kText, RectF(30, 274, 130, 32));
+    FillGradient(g, RectF(164, 250, 4, 44), 2.0f, true);
 
-    const RectF resetTile(196, 234, 166, 86);
+    const RectF resetTile(196, 234, 166, 76);
+    DrawCard(g, resetTile);
     if (gAutoRespawn.load()) {
-        DrawCard(g, resetTile);
         FillGradient(g, resetTile, 14.0f);
-        Text(g, L"UNTIL RESET", gFontLabel, ui::kText, RectF(210, 246, 120, 16));
+        Text(g, L"UNTIL RESET", gFontLabel, ui::kText, RectF(210, 244, 120, 16));
         Text(g, L"auto reposition", gFontSmall, Gdiplus::Color(220, 255, 255, 255),
-             RectF(210, 262, 120, 14));
+             RectF(210, 259, 120, 14));
         swprintf_s(line, L"%d / %d", t.catchesSinceRespawn, gRespawnEveryCatches.load());
-        Text(g, line, gFontBig, ui::kText, RectF(208, 280, 130, 32));
+        Text(g, line, gFontBig, ui::kText, RectF(208, 274, 130, 32));
         Gdiplus::SolidBrush white(ui::kText);
-        FillRound(g, white, RectF(342, 252, 4, 50), 2.0f);
+        FillRound(g, white, RectF(342, 250, 4, 44), 2.0f);
     } else {
-        DrawCard(g, resetTile);
-        Text(g, L"UNTIL RESET", gFontLabel, ui::kMuted, RectF(210, 246, 120, 16));
-        Text(g, L"auto reposition", gFontSmall, ui::kMuted, RectF(210, 262, 120, 14));
-        Text(g, L"OFF", gFontBig, ui::kMuted, RectF(208, 280, 130, 32));
+        Text(g, L"UNTIL RESET", gFontLabel, ui::kMuted, RectF(210, 244, 120, 16));
+        Text(g, L"auto reposition", gFontSmall, ui::kMuted, RectF(210, 259, 120, 14));
+        Text(g, L"OFF", gFontBig, ui::kMuted, RectF(208, 274, 130, 32));
     }
 
-    // --- Settings card -----------------------------------------------------
-    DrawCard(g, RectF(18, 332, 344, 136));
-    RowLabel(g, 340, L"Wait for fish", L"seconds before re-casting");
-    FillInset(g, RectF(266, 345, 80, 30), 9.0f); // EDIT control sits on top
-    Divider(g, 383);
-    RowLabel(g, 386, L"Auto reposition", L"reset character (Esc · R · Enter)");
+    // --- Settings card (EDIT controls sit on top of the inset boxes) ---------
+    DrawCard(g, RectF(18, 322, 344, 180));
+    RowLabel(g, 328, L"Wait for fish", L"seconds before re-casting");
+    FillInset(g, RectF(266, 333, 80, 30), 9.0f);
+    Divider(g, 369);
+    RowLabel(g, 372, L"Collect delay", L"seconds before holding T");
+    FillInset(g, RectF(266, 377, 80, 30), 9.0f);
+    Divider(g, 413);
+    RowLabel(g, 416, L"Auto reposition", L"reset character (Esc \u00B7 R \u00B7 Enter)");
     {
-        const RectF track(300, 394, 46, 24);
+        const RectF track(300, 424, 46, 24);
         const bool on = gAutoRespawn.load();
         if (on) FillGradient(g, track, 12.0f);
         else FillInset(g, track, 12.0f);
         Gdiplus::SolidBrush knob(on ? ui::kText : ui::kMuted);
-        g.FillEllipse(&knob, RectF(on ? 325.0f : 303.0f, 397.0f, 18.0f, 18.0f));
-        const RectF hit(262, 386, 94, 40);
-        HoverOverlay(g, RectF(296, 390, 54, 32), 14.0f, kHitRespawnToggle);
-        AddHit(hit, kHitRespawnToggle);
+        g.FillEllipse(&knob, RectF(on ? 325.0f : 303.0f, 427.0f, 18.0f, 18.0f));
+        HoverOverlay(g, RectF(296, 420, 54, 32), 14.0f, kHitRespawnToggle);
+        AddHit(RectF(262, 416, 94, 40), kHitRespawnToggle);
     }
-    Divider(g, 428);
-    RowLabel(g, 430, L"Reset every", L"catches (also after 2 missed casts)");
-    FillInset(g, RectF(266, 434, 80, 30), 9.0f); // EDIT control sits on top
+    Divider(g, 457);
+    RowLabel(g, 460, L"Reset every", L"catches (also after 2 missed casts)");
+    FillInset(g, RectF(266, 465, 80, 30), 9.0f);
 
     // --- Buttons -------------------------------------------------------------
     std::wstring start = (t.enabled ? L"PAUSE   " : L"START   ") + HotkeyHint();
-    GradientButton(g, RectF(18, 482, 212, 50), start.c_str(), kHitStart, 14.0f);
+    GradientButton(g, RectF(18, 514, 212, 50), start.c_str(), kHitStart, 14.0f);
     std::wstring quit = L"EXIT   ( " + KeyDisplayName(gQuitHotkeyVk.load()) + L" )";
-    const RectF exitR(242, 482, 120, 50);
+    const RectF exitR(242, 514, 120, 50);
     DrawCard(g, exitR);
     HoverOverlay(g, exitR, 14.0f, kHitExit);
     TextCenter(g, quit.c_str(), gFontButton, ui::kSoft, exitR);
@@ -1450,20 +1480,20 @@ void DrawFishingTab(Gdiplus::Graphics& g, const Telemetry& t) {
 
     // --- Footer --------------------------------------------------------------
     if (gCalibrating.load()) {
-        TextCenter(g, L"Calibrating · see the Setup tab (Esc cancels)", gFontSmall, ui::kWarn,
-                   RectF(18, 546, 344, 18));
+        TextCenter(g, L"Calibrating \u00B7 see the Setup tab (Esc cancels)", gFontSmall, ui::kWarn,
+                   RectF(18, 578, 344, 18));
     } else {
         const POINT cast = GetCastPoint();
-        swprintf_s(line, L"Cast point (%ld, %ld)  ·  v2.0", cast.x, cast.y);
-        TextCenter(g, line, gFontSmall, ui::kMuted, RectF(18, 546, 344, 18));
+        swprintf_s(line, L"Cast point (%ld, %ld)  \u00B7  v2.1", cast.x, cast.y);
+        TextCenter(g, line, gFontSmall, ui::kMuted, RectF(18, 578, 344, 18));
     }
 }
 
 void DrawKeyRow(Gdiplus::Graphics& g, float y, const wchar_t* title, const wchar_t* sub,
                 const std::wstring& key, int id, bool binding) {
-    DrawCard(g, RectF(18, y, 344, 70));
-    RowLabel(g, y + 14, title, sub);
-    const RectF chip(236, y + 17, 110, 36);
+    DrawCard(g, RectF(18, y, 344, 58));
+    RowLabel(g, y + 9, title, sub);
+    const RectF chip(236, y + 11, 110, 36);
     if (binding) {
         GradientButton(g, chip, L"Press a key...", id);
     } else {
@@ -1472,22 +1502,26 @@ void DrawKeyRow(Gdiplus::Graphics& g, float y, const wchar_t* title, const wchar
 }
 
 void DrawHotkeysTab(Gdiplus::Graphics& g) {
-    DrawCard(g, RectF(18, 128, 344, 74));
-    Text(g, L"HOTKEYS", gFontLabel, ui::kText, RectF(34, 140, 300, 16));
-    Text(g, L"Click a key, then press the new key.", gFontSmall, ui::kMuted, RectF(34, 160, 310, 15));
-    Text(g, L"Global: work in any window. Esc cancels.", gFontSmall, ui::kMuted,
-         RectF(34, 176, 310, 15));
+    DrawCard(g, RectF(18, 128, 344, 70));
+    Text(g, L"HOTKEYS", gFontLabel, ui::kText, RectF(34, 138, 300, 16));
+    Text(g, L"Click a key, then press the new key.", gFontSmall, ui::kMuted, RectF(34, 157, 310, 15));
+    Text(g, L"Start/Exit work in any window. Esc cancels.", gFontSmall, ui::kMuted,
+         RectF(34, 173, 310, 15));
 
     const bool binding = gBindingHotkey.load();
-    DrawKeyRow(g, 214, L"Start / Pause", L"global hotkey",
+    DrawKeyRow(g, 210, L"Start / Pause", L"global hotkey",
                KeyDisplayName(gToggleHotkeyVk.load()), kHitBindToggle, binding && gBindingTarget == 1);
-    DrawKeyRow(g, 298, L"Safe exit", L"closes the macro",
+    DrawKeyRow(g, 276, L"Safe exit", L"closes the macro",
                KeyDisplayName(gQuitHotkeyVk.load()), kHitBindQuit, binding && gBindingTarget == 2);
-    DrawKeyRow(g, 382, L"Collect key", L"held 4s after each catch (fixed)", L"T", kHitNone, false);
+    DrawKeyRow(g, 342, L"Correction key", L"pressed first when starting",
+               KeyDisplayName(gCorrectionKeyVk.load()), kHitBindCorrection, binding && gBindingTarget == 3);
+    DrawKeyRow(g, 408, L"Rod key", L"pressed next to equip the rod",
+               KeyDisplayName(gRodKeyVk.load()), kHitBindRod, binding && gBindingTarget == 4);
+    DrawKeyRow(g, 474, L"Collect key", L"held after each catch (fixed)", L"T", kHitNone, false);
 
     if (binding) {
-        TextCenter(g, L"Waiting for a key press · Esc cancels", gFontSmall, ui::kWarn,
-                   RectF(18, 466, 344, 18));
+        TextCenter(g, L"Waiting for a key press \u00B7 Esc cancels", gFontSmall, ui::kWarn,
+                   RectF(18, 548, 344, 18));
     }
 }
 
@@ -1573,6 +1607,13 @@ void PaintHud(HWND hwnd) {
         HoverOverlay(g, closeR, 9.0f, kHitClose);
         TextCenter(g, L"✕", gFontBody, gHoverHit == kHitClose ? ui::kText : ui::kMuted, closeR);
         AddHit(closeR, kHitClose);
+        const RectF minR(closeR.X - 34.0f, closeR.Y, 28.0f, 28.0f);
+        HoverOverlay(g, minR, 9.0f, kHitMinimize);
+        {
+            Gdiplus::Pen pen(gHoverHit == kHitMinimize ? ui::kText : ui::kMuted, 1.6f);
+            g.DrawLine(&pen, minR.X + 9.0f, minR.Y + 14.5f, minR.X + 19.0f, minR.Y + 14.5f);
+        }
+        AddHit(minR, kHitMinimize);
 
         // Segmented tab bar.
         DrawCard(g, RectF(18, 72, 344, 42));
@@ -1797,6 +1838,14 @@ void LoadSettings() {
     gRespawnEveryCatches.store(std::clamp<int>(
         ReadIntSetting(L"Fishing", L"RespawnEveryCatches", kDefaultRespawnEveryCatches, path),
         kMinRespawnEveryCatches, kMaxRespawnEveryCatches));
+    gCollectDelayMs.store(std::min<ULONGLONG>(
+        static_cast<ULONGLONG>(GetPrivateProfileIntW(L"Fishing", L"CollectDelaySeconds",
+            static_cast<UINT>(kDefaultCollectDelayMs / 1000), path.c_str())) * 1000ULL,
+        kMaxCollectDelayMs));
+    const UINT correctionVk = GetPrivateProfileIntW(L"Keys", L"CorrectionVk", '1', path.c_str());
+    const UINT rodVk = GetPrivateProfileIntW(L"Keys", L"RodVk", '5', path.c_str());
+    if (correctionVk > 0 && correctionVk <= 0xFF) gCorrectionKeyVk.store(static_cast<WORD>(correctionVk));
+    if (rodVk > 0 && rodVk <= 0xFF) gRodKeyVk.store(static_cast<WORD>(rodVk));
 
     // Calibration - each user's own cast point/bar/exit regions, saved so
     // they don't have to recalibrate on every single launch.
@@ -1833,6 +1882,9 @@ void SaveSettings() {
     WritePrivateProfileStringW(L"Fishing", L"WaitForFishSeconds", buf, path.c_str());
     WriteIntSetting(L"Fishing", L"AutoRespawn", gAutoRespawn.load() ? 1 : 0, path);
     WriteIntSetting(L"Fishing", L"RespawnEveryCatches", gRespawnEveryCatches.load(), path);
+    WriteIntSetting(L"Fishing", L"CollectDelaySeconds", static_cast<int>(gCollectDelayMs.load() / 1000), path);
+    WriteIntSetting(L"Keys", L"CorrectionVk", gCorrectionKeyVk.load(), path);
+    WriteIntSetting(L"Keys", L"RodVk", gRodKeyVk.load(), path);
 
     const POINT cast = GetCastPoint();
     WriteIntSetting(L"Calibration", L"CastX", cast.x, path);
@@ -1913,6 +1965,7 @@ void SetActiveTab(int tab) {
     const int show = (tab == 0) ? SW_SHOW : SW_HIDE;
     if (gWaitFishEdit) ShowWindow(gWaitFishEdit, show);
     if (gRespawnEdit) ShowWindow(gRespawnEdit, show);
+    if (gCollectEdit) ShowWindow(gCollectEdit, show);
     InvalidateRect(gWindow, nullptr, FALSE);
 }
 
@@ -1933,6 +1986,19 @@ void UpdateWaitForFishSetting() {
     wchar_t buf[32];
     swprintf_s(buf, L"%u", static_cast<unsigned>(ms / 1000));
     SetWindowTextW(gWaitFishEdit, buf);
+    SaveSettings();
+}
+
+void UpdateCollectDelaySetting() {
+    wchar_t buf[32]{};
+    GetWindowTextW(gCollectEdit, buf, 32);
+    wchar_t* end = nullptr;
+    const unsigned long value = wcstoul(buf, &end, 10);
+    if (end != buf) {
+        gCollectDelayMs.store(std::min<ULONGLONG>(static_cast<ULONGLONG>(value) * 1000ULL, kMaxCollectDelayMs));
+    }
+    swprintf_s(buf, L"%u", static_cast<unsigned>(gCollectDelayMs.load() / 1000));
+    SetWindowTextW(gCollectEdit, buf);
     SaveSettings();
 }
 
@@ -1957,6 +2023,17 @@ void HandleHit(HWND hwnd, int id) {
             break;
         case kHitStart:
             ToggleTracker();
+            break;
+        case kHitMinimize:
+            ShowWindow(hwnd, SW_MINIMIZE);
+            break;
+        case kHitBindCorrection:
+            if (gBindingHotkey.load() && gBindingTarget == 3) EndHotkeyBind();
+            else StartHotkeyBind(3);
+            break;
+        case kHitBindRod:
+            if (gBindingHotkey.load() && gBindingTarget == 4) EndHotkeyBind();
+            else StartHotkeyBind(4);
             break;
         case kHitExit:
         case kHitClose:
@@ -2005,9 +2082,12 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
     switch (message) {
         case WM_CREATE: {
             // Positioned over the inset boxes drawn in DrawFishingTab.
-            gWaitFishEdit = CreateNumberEdit(hwnd, ID_WAIT_FISH_EDIT, 272, 349);
-            gRespawnEdit = CreateNumberEdit(hwnd, ID_RESPAWN_EDIT, 272, 438);
+            gWaitFishEdit = CreateNumberEdit(hwnd, ID_WAIT_FISH_EDIT, 272, 337);
+            gCollectEdit = CreateNumberEdit(hwnd, ID_COLLECT_EDIT, 272, 381);
+            gRespawnEdit = CreateNumberEdit(hwnd, ID_RESPAWN_EDIT, 272, 469);
             wchar_t buf[32];
+            swprintf_s(buf, L"%u", static_cast<unsigned>(gCollectDelayMs.load() / 1000));
+            SetWindowTextW(gCollectEdit, buf);
             swprintf_s(buf, L"%u", static_cast<unsigned>(gWaitForFishMs.load() / 1000));
             SetWindowTextW(gWaitFishEdit, buf);
             swprintf_s(buf, L"%d", gRespawnEveryCatches.load());
@@ -2023,6 +2103,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         case WM_COMMAND:
             if (LOWORD(wParam) == ID_WAIT_FISH_EDIT && HIWORD(wParam) == EN_KILLFOCUS) {
                 UpdateWaitForFishSetting();
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            if (LOWORD(wParam) == ID_COLLECT_EDIT && HIWORD(wParam) == EN_KILLFOCUS) {
+                UpdateCollectDelaySetting();
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
             if (LOWORD(wParam) == ID_RESPAWN_EDIT && HIWORD(wParam) == EN_KILLFOCUS) {
@@ -2102,6 +2186,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             const WORD vk = gCapturedVk;
             if (target == 1) ApplyToggleHotkey(vk);
             else if (target == 2) ApplyQuitHotkey(vk);
+            else if (target == 3) { gCorrectionKeyVk.store(vk); SaveSettings(); }
+            else if (target == 4) { gRodKeyVk.store(vk); SaveSettings(); }
             EndHotkeyBind();
             return 0;
         }
@@ -2165,8 +2251,10 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     wc.hIcon = LoadIcon(nullptr, IDI_APPLICATION);
     RegisterClassEx(&wc);
 
-    gWindow = CreateWindowEx(WS_EX_TOPMOST | WS_EX_TOOLWINDOW | WS_EX_LAYERED,
-        kClassName, L"Sky's S2 Fishing Macro", WS_POPUP | WS_CLIPCHILDREN,
+    // No WS_EX_TOOLWINDOW: the window needs a taskbar button so it can be
+    // minimized and restored.
+    gWindow = CreateWindowEx(WS_EX_TOPMOST | WS_EX_LAYERED,
+        kClassName, L"Sky's S2 Fishing Macro", WS_POPUP | WS_CLIPCHILDREN | WS_MINIMIZEBOX | WS_SYSMENU,
         24, 80, ui::kWidth, ui::kHeight, nullptr, nullptr, instance, nullptr);
     if (!gWindow) return 1;
 
@@ -2174,6 +2262,12 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     // rounded corners.
     SetLayeredWindowAttributes(gWindow, 0, 247, LWA_ALPHA);
     SetWindowRgn(gWindow, CreateRoundRectRgn(0, 0, ui::kWidth + 1, ui::kHeight + 1, 26, 26), TRUE);
+
+    HICON appIcon = nullptr;
+    if (gFishOnIcon && gFishOnIcon->GetHICON(&appIcon) == Gdiplus::Ok && appIcon) {
+        SendMessage(gWindow, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(appIcon));
+        SendMessage(gWindow, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(appIcon));
+    }
 
     SetActiveTab(0);
 
@@ -2211,6 +2305,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     DeleteObject(gUiFont);
     DeleteObject(gBackgroundBrush);
     DeleteObject(gInputBrush);
+    if (appIcon) DestroyIcon(appIcon);
     // GDI+ objects must be destroyed before GdiplusShutdown.
     DestroyUiFonts();
     delete gFishOnIcon;

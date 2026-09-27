@@ -15,6 +15,12 @@ on your own screen, so it runs at any resolution.
   white block, using short holds and releases to keep the block in the zone.
 - **Auto reposition (set respawn):** resets your character (Esc → R → Enter) every *N* catches
   (default 10), and after 2 missed casts in a row, so you stay on the same spot.
+- **Equip on start:** every time you press Start it quickly taps the *correction key* (default
+  `1`) and then the *rod key* (default `5`). You can change both in the **Hotkeys** tab.
+- **Collect delay:** choose how many seconds to wait after the minigame before holding **T**
+  (default 4).
+- **Minimize:** use the `–` button in the header. The macro keeps running, and you can bring it
+  back from the taskbar.
 - **Safe focus handling:** clicks and keys are only sent when the Roblox window is really in
   front, so nothing gets typed into other windows.
 - **Settings are saved** to `SkysS2FishingMacro.ini` next to the exe (hotkeys, wait time,
