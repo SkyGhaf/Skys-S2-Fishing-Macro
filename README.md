@@ -17,8 +17,8 @@ on your own screen, so it runs at any resolution.
   (default 10), and after 2 missed casts in a row, so you stay on the same spot.
 - **Item check:** after holding **T** the macro looks for the game's item message (for example
   "Clown Fish x1", in any colour or icon). Without a message it holds T again, up to 2 more times.
-  Only a seen message counts as a catch; otherwise it counts as a *failed collect*. The Fishing tab
-  shows catches, failed collects and the success rate. Calibrate the **Collect message** box in the
+  Only a seen message counts as a catch; otherwise it counts as *no item* (the pickup failed, or the game gave nothing - the two look the same on screen). The Fishing tab
+  shows catches, no-item count and the success rate. Calibrate the **Collect message** box in the
   Setup tab. Without it, every collect counts as a catch.
 - **Equip on start:** every time you press Start it quickly taps the *correction key* (default
   `1`) and then the *rod key* (default `5`). You can change both in the **Hotkeys** tab.

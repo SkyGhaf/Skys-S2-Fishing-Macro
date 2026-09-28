@@ -1705,8 +1705,10 @@ void DrawFishingTab(Gdiplus::Graphics& g, const Telemetry& t) {
     FillGradient(g, RectF(164, 250, 4, 44), 2.0f, true);
 
     DrawCard(g, RectF(196, 234, 166, 76));
-    Text(g, L"FAILED COLLECT", gFontLabel, ui::kText, RectF(210, 244, 130, 16));
-    Text(g, L"no item message", gFontSmall, ui::kMuted, RectF(210, 259, 130, 14));
+    // No item message can mean the pickup failed OR the game gave nothing
+    // (catching nothing is possible) - the two look identical on screen.
+    Text(g, L"NO ITEM", gFontLabel, ui::kText, RectF(210, 244, 130, 16));
+    Text(g, L"failed / caught nothing", gFontSmall, ui::kMuted, RectF(210, 259, 140, 14));
     swprintf_s(line, L"%d", t.failedCollects);
     Text(g, line, gFontBig, t.failedCollects ? ui::kBad : ui::kText, RectF(208, 274, 130, 32));
     {
@@ -1750,11 +1752,11 @@ void DrawFishingTab(Gdiplus::Graphics& g, const Telemetry& t) {
              RectF(34, 464, 312, 15));
     } else {
         const wchar_t* last = t.lastCollectDetected == 1 ? L"Last collect: item message seen ✓"
-                            : t.lastCollectDetected == 0 ? L"Last collect: no message (failed)"
+                            : t.lastCollectDetected == 0 ? L"Last collect: no item (failed / nothing)"
                             : L"Waiting for the first collect";
         Text(g, last, gFontBody, t.lastCollectDetected == 0 ? ui::kBad : ui::kSoft,
              RectF(34, 442, 312, 18));
-        swprintf_s(line, L"No message → T is retried up to %d× before it counts as failed",
+        swprintf_s(line, L"No message → T is retried up to %d× before it counts as no item",
                    kCollectRetries);
         Text(g, line, gFontSmall, ui::kMuted, RectF(34, 464, 312, 15));
     }
