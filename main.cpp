@@ -150,7 +150,7 @@ struct Telemetry {
     int collectAttempt = 0;       // 0-based try of the current collect
     int lastCollectDetected = -1; // -1 no check yet, 0 not found, 1 detected
     bool collectCheckReady = false;
-    int rarityCounts[6] = {}; // indexed by Rarity (kRarityCount)
+    int rarityCounts[4] = {}; // indexed by Rarity (kRarityCount)
     int lastRarity = -1;
     int confidence = 0;
     ControlState state = ControlState::Paused;
@@ -851,14 +851,14 @@ int CollectMessageScore(const CaptureSurface& surface, const std::vector<uint32_
 }
 
 // Rarity of a collected item, read from the colour of the message's banner
-// border (a long horizontal line behind the name: blue for Clown Fish, gold
-// for Crustadon, red for Mythic items like Lost Mask). Only red is a known
-// rarity name so far; the rest are labelled by colour.
-enum Rarity { kRarityMythic = 0, kRarityGold, kRarityGreen, kRarityBlue, kRarityPurple, kRarityOther,
-              kRarityCount };
-const wchar_t* const kRarityNames[kRarityCount] = {L"Mythic", L"Gold", L"Green", L"Blue", L"Purple", L"Other"};
+// border (a long horizontal line behind the name): red = Mythic (Lost Mask),
+// gold = Legendary (Crustadon), blue = Rare (Clown Fish). Common items have a
+// grey banner, i.e. no coloured line at all.
+enum Rarity { kRarityMythic = 0, kRarityLegendary, kRarityRare, kRarityCommon, kRarityCount };
+const wchar_t* const kRarityNames[kRarityCount] = {L"Mythic", L"Legendary", L"Rare", L"Common"};
 
-// Colour bucket of a saturated pixel, or -1 for grey/dark/white.
+// Rarity colour of a saturated pixel, or -1 for grey/dark/white (and for
+// green/purple, which no rarity uses).
 int RarityBucket(uint32_t p) {
     int r, g, b;
     ReadRgb(p, r, g, b);
@@ -872,10 +872,9 @@ int RarityBucket(uint32_t p) {
     else h = 60.0 * (static_cast<double>(r - g) / d + 4.0);
     if (h < 0.0) h += 360.0;
     if (h < 15.0 || h >= 335.0) return kRarityMythic;
-    if (h < 75.0) return kRarityGold;
-    if (h < 165.0) return kRarityGreen;
-    if (h < 255.0) return kRarityBlue;
-    return kRarityPurple;
+    if (h < 75.0) return kRarityLegendary;
+    if (h >= 165.0 && h < 255.0) return kRarityRare;
+    return -1;
 }
 
 // Longest horizontal run of one colour among pixels that are new since the
@@ -885,8 +884,8 @@ int RarityBucket(uint32_t p) {
 int ClassifyRarity(const CaptureSurface& surface, const std::vector<uint32_t>& baseline, int& runOut) {
     runOut = 0;
     const int w = surface.width;
-    if (static_cast<int>(baseline.size()) != w * surface.height) return kRarityOther;
-    int best = kRarityOther;
+    if (static_cast<int>(baseline.size()) != w * surface.height) return kRarityCommon;
+    int best = kRarityCommon;
     for (int y = 0; y < surface.height; ++y) {
         int run = 0;
         int prev = -1;
@@ -906,8 +905,10 @@ int ClassifyRarity(const CaptureSurface& surface, const std::vector<uint32_t>& b
             }
         }
     }
-    // A short run is just icon/text colour - no recognisable banner colour.
-    if (runOut < std::max(12, w / 5)) return kRarityOther;
+    // A short run is just icon colour (e.g. the orange fish on a Common
+    // message gives ~35 px; real banners give 87-100 px on the same scale),
+    // so without a line over 30% of the width the banner is grey: Common.
+    if (runOut < std::max(12, w * 3 / 10)) return kRarityCommon;
     return best;
 }
 
@@ -1024,13 +1025,13 @@ DWORD WINAPI TrackerThread(void*) {
     double collectHitSinceMs = -1.0;
     int rarityCounts[kRarityCount] = {};
     int lastRarity = -1;
-    int attemptRarity = kRarityOther; // best classification during this attempt
+    int attemptRarity = kRarityCommon; // best classification during this attempt
     int attemptRarityRun = -1;
     // Snapshot of the collect-message region right before T goes down.
     auto takeCollectBaseline = [&]() {
         collectSeen = false;
         collectHitSinceMs = -1.0;
-        attemptRarity = kRarityOther;
+        attemptRarity = kRarityCommon;
         attemptRarityRun = -1;
         collectBaseline.clear();
         if (collectReady && collectSurface.Grab(collectRect.left, collectRect.top)) {
@@ -1838,12 +1839,11 @@ void DrawFishingTab(Gdiplus::Graphics& g, const Telemetry& t) {
     {
         const Gdiplus::Color dots[kRarityCount] = {
             Gdiplus::Color(255, 248, 82, 82), Gdiplus::Color(255, 250, 190, 50),
-            Gdiplus::Color(255, 80, 220, 120), Gdiplus::Color(255, 70, 150, 255),
-            Gdiplus::Color(255, 170, 110, 255), Gdiplus::Color(255, 150, 150, 170)};
+            Gdiplus::Color(255, 70, 150, 255), Gdiplus::Color(255, 165, 168, 185)};
         for (int i = 0; i < kRarityCount; ++i) {
-            const float cx = 34.0f + (i % 3) * 106.0f;
-            const float cy = 442.0f + (i / 3) * 28.0f;
-            const RectF chip(cx, cy, 98.0f, 24.0f);
+            const float cx = 34.0f + (i % 2) * 160.0f;
+            const float cy = 442.0f + (i / 2) * 28.0f;
+            const RectF chip(cx, cy, 152.0f, 24.0f);
             FillInset(g, chip, 12.0f);
             if (t.lastRarity == i && t.lastCollectDetected == 1) {
                 Gdiplus::Pen ring(dots[i], 1.5f);
@@ -1854,9 +1854,9 @@ void DrawFishingTab(Gdiplus::Graphics& g, const Telemetry& t) {
             Gdiplus::SolidBrush dot(dots[i]);
             g.FillEllipse(&dot, RectF(cx + 9.0f, cy + 8.0f, 8.0f, 8.0f));
             Text(g, kRarityNames[i], gFontSmall, t.collectCheckReady ? ui::kSoft : ui::kMuted,
-                 RectF(cx + 22.0f, cy, 50.0f, 24.0f));
+                 RectF(cx + 22.0f, cy, 80.0f, 24.0f));
             swprintf_s(line, L"%d", t.rarityCounts[i]);
-            Text(g, line, gFontLabel, ui::kText, RectF(cx + 60.0f, cy, 32.0f, 24.0f),
+            Text(g, line, gFontLabel, ui::kText, RectF(cx + 100.0f, cy, 42.0f, 24.0f),
                  Gdiplus::StringAlignmentFar);
         }
     }
