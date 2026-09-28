@@ -15,10 +15,15 @@ on your own screen, so it runs at any resolution.
   white block, using short holds and releases to keep the block in the zone.
 - **Auto reposition (set respawn):** resets your character (Esc → R → Enter) every *N* catches
   (default 10), and after 2 missed casts in a row, so you stay on the same spot.
+- **Item check:** after holding **T** the macro looks for the game's item message (for example
+  "Clown Fish x1", in any colour or icon). Without a message it holds T again, up to 2 more times.
+  Only a seen message counts as a catch; otherwise it counts as a *failed collect*. The Fishing tab
+  shows catches, failed collects and the success rate. Calibrate the **Collect message** box in the
+  Setup tab. Without it, every collect counts as a catch.
 - **Equip on start:** every time you press Start it quickly taps the *correction key* (default
   `1`) and then the *rod key* (default `5`). You can change both in the **Hotkeys** tab.
-- **Collect delay:** choose how many seconds to wait after the minigame before holding **T**
-  (default 4).
+- **Collect delay / Hold T time:** choose how long to wait after the minigame before holding **T**,
+  and how long T is held (both default 4 s). These settings are on the **Settings** tab.
 - **Minimize:** use the `–` button in the header. The macro keeps running, and you can bring it
   back from the taskbar.
 - **Minigame log (Setup tab):** writes one CSV per minigame to `logs\` (zone, block, velocities,
@@ -36,6 +41,8 @@ on your own screen, so it runs at any resolution.
    - **Cast point:** click where you want to cast.
    - **Fishing bar:** drag a tight box around the vertical minigame bar.
    - **Exit button:** drag a box around the red *Exit* button that shows during the minigame.
+   - **Collect message:** drag a box around where the "<item> x1" message appears after collecting
+     (next to your character).
 4. Press **Start** (default hotkey `-`). The default exit hotkey is `=`. You can change both in
    the **Hotkeys** tab.
 

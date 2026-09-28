@@ -48,6 +48,7 @@ constexpr int ID_CALIBRATE_EXIT = 1009;
 constexpr int ID_RESPAWN_CHECK = 1010;
 constexpr int ID_RESPAWN_EDIT = 1011;
 constexpr int ID_COLLECT_EDIT = 1012;
+constexpr int ID_HOLD_EDIT = 1013;
 constexpr int HOTKEY_TOGGLE = 1;
 constexpr int HOTKEY_QUIT = 2;
 // Shared by both "Calibrate Start Point" and the hotkey binder: whichever
@@ -67,12 +68,22 @@ enum class ControlState { Waiting, Holding, Releasing, Floating, Paused };
 //   Hook    -> existing bar-catching control, until the exit bar disappears
 //   Collect -> a fixed pause after hooking ends
 //   HoldKey -> holds the T key to collect/confirm, then loops back to Cast
-enum class Phase { Cast, Hook, Collect, HoldKey, WaitForFish, Respawn };
+enum class Phase { Cast, Hook, Collect, HoldKey, VerifyCollect, WaitForFish, Respawn };
 
 // Pause between the minigame ending and holding T to collect (user setting).
 constexpr ULONGLONG kDefaultCollectDelayMs = 4000;
 constexpr ULONGLONG kMaxCollectDelayMs = 30000;
-constexpr ULONGLONG kHoldKeyDurationMs = 4000;
+// How long T is held to collect (user setting, "Hold T time").
+constexpr ULONGLONG kDefaultHoldKeyMs = 4000;
+constexpr ULONGLONG kMinHoldKeyMs = 1000;
+constexpr ULONGLONG kMaxHoldKeyMs = 15000;
+// Item-collection check: after releasing T, keep looking for the game's
+// "<item> x1" message this long; without it the hold is retried this many
+// times before the catch is counted as "failed to collect".
+constexpr ULONGLONG kCollectVerifyMs = 2500;
+constexpr int kCollectRetries = 2;
+// The message must stay visible this long (filters one-frame flashes).
+constexpr double kCollectConfirmMs = 150.0;
 // Auto reposition (set respawn): every N catches the character is reset with
 // Esc -> R -> Enter, which puts it back on its spawn point and undoes the
 // small drift after each catch. After the keys we wait this long for the
@@ -135,6 +146,10 @@ struct Telemetry {
     int catchesSinceRespawn = 0;
     int totalCatches = 0;
     int zonePct = -1; // share of this minigame's frames with the block inside the zone
+    int failedCollects = 0;
+    int collectAttempt = 0;       // 0-based try of the current collect
+    int lastCollectDetected = -1; // -1 no check yet, 0 not found, 1 detected
+    bool collectCheckReady = false;
     int confidence = 0;
     ControlState state = ControlState::Paused;
     Phase phase = Phase::Cast;
@@ -147,6 +162,7 @@ std::atomic<bool> gAutoRespawn{false};
 // Setup tab toggle: write one CSV per minigame into logs\ for tuning.
 std::atomic<bool> gMinigameLog{false};
 std::atomic<ULONGLONG> gCollectDelayMs{kDefaultCollectDelayMs};
+std::atomic<ULONGLONG> gHoldKeyMs{kDefaultHoldKeyMs};
 // Pressed once, quickly, every time the macro is started: the correction
 // key first, then the rod key (re-equips the rod).
 std::atomic<WORD> gCorrectionKeyVk{static_cast<WORD>('1')};
@@ -160,6 +176,7 @@ HWND gExitButton = nullptr;
 HWND gWaitFishEdit = nullptr;
 HWND gRespawnEdit = nullptr;
 HWND gCollectEdit = nullptr;
+HWND gHoldKeyEdit = nullptr;
 HWND gCalibrateButton = nullptr;
 HWND gCalibrateBarButton = nullptr;
 HWND gCalibrateExitButton = nullptr;
@@ -167,10 +184,10 @@ HWND gToggleBindButton = nullptr; // Keystrokes tab: rebind Start/Pause
 HWND gExitBindButton = nullptr;   // Keystrokes tab: rebind Exit
 HFONT gUiFont = nullptr;
 HBRUSH gBackgroundBrush = nullptr;
-int gActiveTab = 0; // 0 = Fishing, 1 = Keystrokes, 2 = Calibration
+int gActiveTab = 0; // 0 = Fishing, 1 = Settings, 2 = Hotkeys, 3 = Setup
 
 // Which calibration is currently in progress, if any.
-enum class CalibrationTarget { None, CastPoint, BarRegion, ExitRegion };
+enum class CalibrationTarget { None, CastPoint, BarRegion, ExitRegion, CollectRegion };
 CalibrationTarget gCalibrationTarget = CalibrationTarget::None; // UI thread only
 POINT gDragStart{};   // first corner of a region drag, set by the mouse hook
 bool gDragging = false; // UI thread only; true between mousedown and mouseup
@@ -271,6 +288,20 @@ void SetExitRect(RECT r) {
     gExitRect = r;
 }
 
+// Where the game shows the "<item> x1" message after collecting.
+std::mutex gCollectRectMutex;
+RECT gCollectRect{0, 0, 0, 0};
+
+RECT GetCollectRect() {
+    std::lock_guard<std::mutex> lock(gCollectRectMutex);
+    return gCollectRect;
+}
+
+void SetCollectRect(RECT r) {
+    std::lock_guard<std::mutex> lock(gCollectRectMutex);
+    gCollectRect = r;
+}
+
 bool RectCalibrated(const RECT& r) {
     return (r.right - r.left) >= kMinRegionSize && (r.bottom - r.top) >= kMinRegionSize;
 }
@@ -303,6 +334,7 @@ const wchar_t* PhaseText(Phase phase) {
         case Phase::Hook: return L"HOOKING";
         case Phase::Collect: return L"COLLECTING";
         case Phase::HoldKey: return L"HOLDING KEY";
+        case Phase::VerifyCollect: return L"CHECKING ITEM";
         case Phase::WaitForFish: return L"WAIT FOR FISH";
         case Phase::Respawn: return L"RESPAWNING";
     }
@@ -794,6 +826,28 @@ uint64_t FrameSignature(const CaptureSurface& surface) {
     return hash;
 }
 
+// New bright pixels in the collect-message region compared to a snapshot
+// taken just before T was pressed. The message's name can be any colour and
+// the icon differs per item, but the text and icon are always much brighter
+// than the deck/water behind them (text ~195-255 vs floor ~46-68), so
+// "pixels that became bright" works for every item.
+inline int Luma(uint32_t p) {
+    int r, g, b;
+    ReadRgb(p, r, g, b);
+    return (r * 299 + g * 587 + b * 114) / 1000;
+}
+
+int CollectMessageScore(const CaptureSurface& surface, const std::vector<uint32_t>& baseline) {
+    const int total = surface.width * surface.height;
+    if (static_cast<int>(baseline.size()) != total) return 0;
+    int score = 0;
+    for (int i = 0; i < total; ++i) {
+        const int now = Luma(surface.pixels[i]);
+        if (now >= 170 && now - Luma(baseline[i]) >= 60) ++score;
+    }
+    return score;
+}
+
 // One CSV per minigame (Setup tab -> Minigame log), for tuning the control.
 struct MinigameLog {
     FILE* file = nullptr;
@@ -846,8 +900,12 @@ DWORD WINAPI TrackerThread(void*) {
     // same regardless of the user's monitor/resolution/game window size.
     RECT bar = GetBarRect();
     RECT exitRect = GetExitRect();
+    RECT collectRect = GetCollectRect();
     CaptureSurface barSurface;
     CaptureSurface exitSurface;
+    CaptureSurface collectSurface;
+    bool collectReady = RectCalibrated(collectRect) &&
+        collectSurface.Create(collectRect.right - collectRect.left, collectRect.bottom - collectRect.top);
     bool barReady = RectCalibrated(bar) &&
         barSurface.Create(bar.right - bar.left, bar.bottom - bar.top);
     bool exitReady = RectCalibrated(exitRect) &&
@@ -894,6 +952,38 @@ DWORD WINAPI TrackerThread(void*) {
     int missedCastsInARow = 0;
     int totalCatches = 0; // whole session, survives pausing
     bool wasRunning = false; // to press the equip keys once per Start
+    // Item-collection check (see CollectMessageScore).
+    int failedCollects = 0;
+    int collectAttempt = 0;
+    int lastCollectDetected = -1;
+    std::vector<uint32_t> collectBaseline;
+    bool collectSeen = false;
+    double collectHitSinceMs = -1.0;
+    // Snapshot of the collect-message region right before T goes down.
+    auto takeCollectBaseline = [&]() {
+        collectSeen = false;
+        collectHitSinceMs = -1.0;
+        collectBaseline.clear();
+        if (collectReady && collectSurface.Grab(collectRect.left, collectRect.top)) {
+            collectBaseline.assign(collectSurface.pixels,
+                                   collectSurface.pixels + collectSurface.width * collectSurface.height);
+        }
+    };
+    // Looks for the item message; sets collectSeen once it has been visible
+    // for kCollectConfirmMs.
+    auto checkCollectMessage = [&](double nowMs) {
+        if (collectSeen || collectBaseline.empty()) return;
+        if (!collectSurface.Grab(collectRect.left, collectRect.top)) return;
+        const int area = collectSurface.width * collectSurface.height;
+        const int needed = std::max(20, area / 50); // 2% of the region
+        if (CollectMessageScore(collectSurface, collectBaseline) >= needed) {
+            if (collectHitSinceMs < 0.0) collectHitSinceMs = nowMs;
+            if (nowMs - collectHitSinceMs >= kCollectConfirmMs) collectSeen = true;
+        } else {
+            collectHitSinceMs = -1.0;
+        }
+    };
+
 
     while (!gQuit.load()) {
         const ULONGLONG now = GetTickCount64(); // coarse; fine for the phase timers
@@ -927,6 +1017,17 @@ DWORD WINAPI TrackerThread(void*) {
                 exitReady = RectCalibrated(freshExit);
             }
             exitRect = freshExit;
+
+            const RECT freshCollect = GetCollectRect();
+            if (freshCollect.right - freshCollect.left != collectRect.right - collectRect.left ||
+                freshCollect.bottom - freshCollect.top != collectRect.bottom - collectRect.top) {
+                collectReady = RectCalibrated(freshCollect) &&
+                    collectSurface.Create(freshCollect.right - freshCollect.left,
+                                          freshCollect.bottom - freshCollect.top);
+            } else {
+                collectReady = RectCalibrated(freshCollect);
+            }
+            collectRect = freshCollect;
         }
         const bool captureReady = barReady && exitReady;
 
@@ -936,6 +1037,10 @@ DWORD WINAPI TrackerThread(void*) {
         current.captureReady = captureReady;
         current.totalCatches = totalCatches;
         current.catchesSinceRespawn = catchesSinceRespawn; // also shown while paused
+        current.failedCollects = failedCollects;
+        current.collectAttempt = collectAttempt;
+        current.lastCollectDetected = lastCollectDetected;
+        current.collectCheckReady = collectReady;
         current.state =current.enabled ? ControlState::Waiting : ControlState::Paused;
 
         if (!current.enabled || !captureReady) {
@@ -1222,6 +1327,7 @@ DWORD WINAPI TrackerThread(void*) {
                 setMouse(false);
                 minigameLog.Close(hookFrames, hookInZone);
                 hookActive = false;
+                collectAttempt = 0;
                 phase = Phase::Collect;
                 current.phase = phase;
                 phaseChangedAt = now;
@@ -1230,6 +1336,7 @@ DWORD WINAPI TrackerThread(void*) {
             setMouse(false);
             current.phaseElapsedMs = static_cast<float>(now - phaseChangedAt);
             if (now - phaseChangedAt >= gCollectDelayMs.load()) {
+                takeCollectBaseline();
                 phase = Phase::HoldKey;
                 current.phase = phase;
                 phaseChangedAt = now;
@@ -1238,27 +1345,56 @@ DWORD WINAPI TrackerThread(void*) {
                     keyDown = true;
                 }
             }
-        } else if (phase == Phase::HoldKey) {
+        } else if (phase == Phase::HoldKey || phase == Phase::VerifyCollect) {
             current.phaseElapsedMs = static_cast<float>(now - phaseChangedAt);
-            if (now - phaseChangedAt >= kHoldKeyDurationMs) {
+            checkCollectMessage(nowMs);
+            const bool checking = !collectBaseline.empty();
+
+            // null = still busy; true/false = this minigame's collect result.
+            int outcome = -1;
+            if (phase == Phase::HoldKey && now - phaseChangedAt >= gHoldKeyMs.load()) {
+                // T is always held for the full time, even if the message
+                // already showed up.
                 if (keyDown) KeyEvent(false, kHoldKeyVk);
                 keyDown = false;
-                // The game deliberately stays focused now. Handing focus back
-                // to the user's previous window (usually this HUD, right after
-                // pressing Start) every cycle was the riskiest cross-thread
-                // focus switch, and the cursor stays on the cast point anyway.
-                // Claiming is done - restart the whole cycle with a real
-                // cast click. Going to WaitForFish here was the bug: nothing
-                // in that phase ever fires a new cast, so if the exit bar
-                // happened to still read as visible for a moment right after
-                // claiming (a leftover from the previous minigame fading
-                // out), it could fall straight through WaitForFish -> Hook
-                // -> Collect -> HoldKey again without ever actually
-                // re-casting, looping between Collect and HoldKey forever.
-                phase = Phase::Cast;
+                if (!checking) outcome = 1;          // no collect region: old behaviour
+                else if (collectSeen) outcome = 1;
+                else {
+                    phase = Phase::VerifyCollect;    // give the message a moment to appear
+                    current.phase = phase;
+                    phaseChangedAt = now;
+                }
+            } else if (phase == Phase::VerifyCollect) {
+                if (collectSeen) {
+                    outcome = 1;
+                } else if (now - phaseChangedAt >= kCollectVerifyMs) {
+                    if (collectAttempt < kCollectRetries) {
+                        // The swinging fish probably cancelled the pickup -
+                        // it is usually still hanging there, so hold T again.
+                        ++collectAttempt;
+                        takeCollectBaseline();
+                        phase = Phase::HoldKey;
+                        current.phase = phase;
+                        phaseChangedAt = now;
+                        if (FocusGame()) {
+                            KeyEvent(true, kHoldKeyVk);
+                            keyDown = true;
+                        }
+                    } else {
+                        outcome = 0;
+                    }
+                }
+            }
+
+            if (outcome >= 0) {
+                // Only a detected item message counts as a catch; the
+                // reposition counter counts every minigame, since the drift
+                // happens either way.
+                if (outcome == 1) ++totalCatches;
+                else ++failedCollects;
+                if (checking) lastCollectDetected = outcome;
                 ++catchesSinceRespawn;
-                ++totalCatches;
-                current.totalCatches = totalCatches;
+                phase = Phase::Cast;
                 if (gAutoRespawn.load() &&
                     catchesSinceRespawn >= gRespawnEveryCatches.load() &&
                     ResetCharacter()) {
@@ -1272,9 +1408,13 @@ DWORD WINAPI TrackerThread(void*) {
                     lastCastConfirmedAt = 0;
                 }
                 current.phase = phase;
+                current.totalCatches = totalCatches;
+                current.failedCollects = failedCollects;
+                current.lastCollectDetected = lastCollectDetected;
                 current.catchesSinceRespawn = catchesSinceRespawn;
                 phaseChangedAt = GetTickCount64();
             }
+            current.collectAttempt = collectAttempt;
         } else if (phase == Phase::Respawn) {
             setMouse(false);
             current.phaseElapsedMs = static_cast<float>(now - phaseChangedAt);
@@ -1341,10 +1481,10 @@ HBRUSH gInputBrush = nullptr;
 
 enum HitId {
     kHitNone = 0,
-    kHitTab0 = 1, kHitTab1, kHitTab2,
+    kHitTab0 = 1, kHitTab1, kHitTab2, kHitTab3,
     kHitStart = 10, kHitExit, kHitClose, kHitRespawnToggle, kHitMinimize,
     kHitBindToggle = 20, kHitBindQuit, kHitBindCorrection, kHitBindRod,
-    kHitCalCast = 30, kHitCalBar, kHitCalExit, kHitLogToggle,
+    kHitCalCast = 30, kHitCalBar, kHitCalExit, kHitLogToggle, kHitCalCollect,
 };
 struct HitRegion {
     RECT rect;
@@ -1512,8 +1652,17 @@ void DrawFishingTab(Gdiplus::Graphics& g, const Telemetry& t) {
             swprintf_s(line, L"Waiting to collect  %.1fs / %.0fs",
                        t.phaseElapsedMs / 1000.0f, gCollectDelayMs.load() / 1000.0f);
         } else if (t.phase == Phase::HoldKey) {
-            swprintf_s(line, L"Holding T  %.1fs / %.0fs",
-                       t.phaseElapsedMs / 1000.0f, kHoldKeyDurationMs / 1000.0f);
+            if (t.collectCheckReady) {
+                swprintf_s(line, L"Holding T  %.1fs / %.0fs  ·  try %d/%d",
+                           t.phaseElapsedMs / 1000.0f, gHoldKeyMs.load() / 1000.0f,
+                           t.collectAttempt + 1, kCollectRetries + 1);
+            } else {
+                swprintf_s(line, L"Holding T  %.1fs / %.0fs",
+                           t.phaseElapsedMs / 1000.0f, gHoldKeyMs.load() / 1000.0f);
+            }
+        } else if (t.phase == Phase::VerifyCollect) {
+            swprintf_s(line, L"Looking for the item message  ·  try %d/%d",
+                       t.collectAttempt + 1, kCollectRetries + 1);
         } else if (t.phase == Phase::Respawn) {
             swprintf_s(line, L"Resetting character  %.1fs / %.0fs",
                        t.phaseElapsedMs / 1000.0f, kRespawnSettleMs / 1000.0f);
@@ -1547,53 +1696,73 @@ void DrawFishingTab(Gdiplus::Graphics& g, const Telemetry& t) {
         TextCenter(g, L"OFF", gFontLabel, ui::kMuted, pill);
     }
 
-    // --- Stat tiles --------------------------------------------------------
+    // --- Stat tiles (2x2) --------------------------------------------------
     DrawCard(g, RectF(18, 234, 166, 76));
     Text(g, L"CATCHES", gFontLabel, ui::kText, RectF(32, 244, 120, 16));
-    Text(g, L"this session", gFontSmall, ui::kMuted, RectF(32, 259, 120, 14));
+    Text(g, L"item collected", gFontSmall, ui::kMuted, RectF(32, 259, 120, 14));
     swprintf_s(line, L"%d", t.totalCatches);
     Text(g, line, gFontBig, ui::kText, RectF(30, 274, 130, 32));
     FillGradient(g, RectF(164, 250, 4, 44), 2.0f, true);
 
-    const RectF resetTile(196, 234, 166, 76);
+    DrawCard(g, RectF(196, 234, 166, 76));
+    Text(g, L"FAILED COLLECT", gFontLabel, ui::kText, RectF(210, 244, 130, 16));
+    Text(g, L"no item message", gFontSmall, ui::kMuted, RectF(210, 259, 130, 14));
+    swprintf_s(line, L"%d", t.failedCollects);
+    Text(g, line, gFontBig, t.failedCollects ? ui::kBad : ui::kText, RectF(208, 274, 130, 32));
+    {
+        Gdiplus::SolidBrush red(ui::kBad);
+        FillRound(g, red, RectF(342, 250, 4, 44), 2.0f);
+    }
+
+    DrawCard(g, RectF(18, 322, 166, 76));
+    Text(g, L"SUCCESS RATE", gFontLabel, ui::kText, RectF(32, 332, 130, 16));
+    Text(g, L"collected / tries", gFontSmall, ui::kMuted, RectF(32, 347, 130, 14));
+    const int attempts = t.totalCatches + t.failedCollects;
+    if (attempts > 0) swprintf_s(line, L"%d%%", t.totalCatches * 100 / attempts);
+    else swprintf_s(line, L"—");
+    Text(g, line, gFontBig, ui::kText, RectF(30, 362, 130, 32));
+    FillGradient(g, RectF(164, 338, 4, 44), 2.0f, true);
+
+    const RectF resetTile(196, 322, 166, 76);
     DrawCard(g, resetTile);
     if (gAutoRespawn.load()) {
         FillGradient(g, resetTile, 14.0f);
-        Text(g, L"UNTIL RESET", gFontLabel, ui::kText, RectF(210, 244, 120, 16));
+        Text(g, L"UNTIL RESET", gFontLabel, ui::kText, RectF(210, 332, 120, 16));
         Text(g, L"auto reposition", gFontSmall, Gdiplus::Color(220, 255, 255, 255),
-             RectF(210, 259, 120, 14));
+             RectF(210, 347, 120, 14));
         swprintf_s(line, L"%d / %d", t.catchesSinceRespawn, gRespawnEveryCatches.load());
-        Text(g, line, gFontBig, ui::kText, RectF(208, 274, 130, 32));
+        Text(g, line, gFontBig, ui::kText, RectF(208, 362, 130, 32));
         Gdiplus::SolidBrush white(ui::kText);
-        FillRound(g, white, RectF(342, 250, 4, 44), 2.0f);
+        FillRound(g, white, RectF(342, 338, 4, 44), 2.0f);
     } else {
-        Text(g, L"UNTIL RESET", gFontLabel, ui::kMuted, RectF(210, 244, 120, 16));
-        Text(g, L"auto reposition", gFontSmall, ui::kMuted, RectF(210, 259, 120, 14));
-        Text(g, L"OFF", gFontBig, ui::kMuted, RectF(208, 274, 130, 32));
+        Text(g, L"UNTIL RESET", gFontLabel, ui::kMuted, RectF(210, 332, 120, 16));
+        Text(g, L"auto reposition", gFontSmall, ui::kMuted, RectF(210, 347, 120, 14));
+        Text(g, L"OFF", gFontBig, ui::kMuted, RectF(208, 362, 130, 32));
     }
 
-    // --- Settings card (EDIT controls sit on top of the inset boxes) ---------
-    DrawCard(g, RectF(18, 322, 344, 180));
-    RowLabel(g, 328, L"Wait for fish", L"seconds before re-casting");
-    FillInset(g, RectF(266, 333, 80, 30), 9.0f);
-    Divider(g, 369);
-    RowLabel(g, 372, L"Collect delay", L"seconds before holding T");
-    FillInset(g, RectF(266, 377, 80, 30), 9.0f);
-    Divider(g, 413);
-    RowLabel(g, 416, L"Auto reposition", L"reset character (Esc \u00B7 R \u00B7 Enter)");
-    {
-        const RectF track(300, 424, 46, 24);
-        const bool on = gAutoRespawn.load();
-        if (on) FillGradient(g, track, 12.0f);
-        else FillInset(g, track, 12.0f);
-        Gdiplus::SolidBrush knob(on ? ui::kText : ui::kMuted);
-        g.FillEllipse(&knob, RectF(on ? 325.0f : 303.0f, 427.0f, 18.0f, 18.0f));
-        HoverOverlay(g, RectF(296, 420, 54, 32), 14.0f, kHitRespawnToggle);
-        AddHit(RectF(262, 416, 94, 40), kHitRespawnToggle);
+    // --- Item check card --------------------------------------------------------
+    DrawCard(g, RectF(18, 410, 344, 92));
+    Text(g, L"ITEM CHECK", gFontLabel, ui::kText, RectF(34, 422, 300, 16));
+    if (!t.collectCheckReady) {
+        Text(g, L"Off · calibrate \"Collect message\" in Setup", gFontBody, ui::kWarn,
+             RectF(34, 442, 312, 18));
+        Text(g, L"Until then every collect counts as a catch.", gFontSmall, ui::kMuted,
+             RectF(34, 464, 312, 15));
+    } else {
+        const wchar_t* last = t.lastCollectDetected == 1 ? L"Last collect: item message seen ✓"
+                            : t.lastCollectDetected == 0 ? L"Last collect: no message (failed)"
+                            : L"Waiting for the first collect";
+        Text(g, last, gFontBody, t.lastCollectDetected == 0 ? ui::kBad : ui::kSoft,
+             RectF(34, 442, 312, 18));
+        swprintf_s(line, L"No message → T is retried up to %d× before it counts as failed",
+                   kCollectRetries);
+        Text(g, line, gFontSmall, ui::kMuted, RectF(34, 464, 312, 15));
     }
-    Divider(g, 457);
-    RowLabel(g, 460, L"Reset every", L"catches (also after 2 missed casts)");
-    FillInset(g, RectF(266, 465, 80, 30), 9.0f);
+    FillInset(g, RectF(34, 484, 312, 6), 3.0f);
+    if (t.phase == Phase::HoldKey || t.phase == Phase::VerifyCollect) {
+        const float frac = std::clamp(static_cast<float>(t.collectAttempt + 1) / (kCollectRetries + 1), 0.0f, 1.0f);
+        FillGradient(g, RectF(34, 484, 312 * frac, 6), 3.0f);
+    }
 
     // --- Buttons -------------------------------------------------------------
     std::wstring start = (t.enabled ? L"PAUSE   " : L"START   ") + HotkeyHint();
@@ -1607,12 +1776,48 @@ void DrawFishingTab(Gdiplus::Graphics& g, const Telemetry& t) {
 
     // --- Footer --------------------------------------------------------------
     if (gCalibrating.load()) {
-        TextCenter(g, L"Calibrating \u00B7 see the Setup tab (Esc cancels)", gFontSmall, ui::kWarn,
+        TextCenter(g, L"Calibrating · see the Setup tab (Esc cancels)", gFontSmall, ui::kWarn,
                    RectF(18, 578, 344, 18));
     } else {
         const POINT cast = GetCastPoint();
-        swprintf_s(line, L"Cast point (%ld, %ld)  \u00B7  v2.2", cast.x, cast.y);
+        swprintf_s(line, L"Cast point (%ld, %ld)  ·  v2.3", cast.x, cast.y);
         TextCenter(g, line, gFontSmall, ui::kMuted, RectF(18, 578, 344, 18));
+    }
+}
+
+// On/off switch drawn at the right of a settings row.
+void DrawToggle(Gdiplus::Graphics& g, float rowY, bool on, int id) {
+    const RectF track(300, rowY + 8, 46, 24);
+    if (on) FillGradient(g, track, 12.0f);
+    else FillInset(g, track, 12.0f);
+    Gdiplus::SolidBrush knob(on ? ui::kText : ui::kMuted);
+    g.FillEllipse(&knob, RectF(on ? 325.0f : 303.0f, rowY + 11, 18.0f, 18.0f));
+    HoverOverlay(g, RectF(296, rowY + 4, 54, 32), 14.0f, id);
+    AddHit(RectF(262, rowY, 94, 40), id);
+}
+
+// Settings tab. The EDIT controls (created in WM_CREATE) sit on the inset
+// boxes of rows 0, 1, 2 and 4 - keep kSettingsRowY in sync with them.
+constexpr float kSettingsTop = 134.0f;
+constexpr float kSettingsRowH = 44.0f;
+inline float SettingsRowY(int row) { return kSettingsTop + row * kSettingsRowH; }
+
+void DrawSettingsTab(Gdiplus::Graphics& g) {
+    DrawCard(g, RectF(18, 128, 344, 6 * kSettingsRowH + 10));
+    const wchar_t* titles[6] = {L"Wait for fish", L"Collect delay", L"Hold T time",
+                                L"Auto reposition", L"Reset every", L"Minigame log"};
+    const wchar_t* subs[6] = {L"seconds before re-casting", L"seconds before holding T",
+                              L"seconds T is held to collect",
+                              L"reset character (Esc · R · Enter)",
+                              L"minigames (also after 2 missed casts)",
+                              L"CSV per minigame in logs\\ (for tuning)"};
+    for (int row = 0; row < 6; ++row) {
+        const float y = SettingsRowY(row);
+        if (row > 0) Divider(g, y - 3.0f);
+        RowLabel(g, y, titles[row], subs[row]);
+        if (row == 3) DrawToggle(g, y, gAutoRespawn.load(), kHitRespawnToggle);
+        else if (row == 5) DrawToggle(g, y, gMinigameLog.load(), kHitLogToggle);
+        else FillInset(g, RectF(266, y + 5, 80, 30), 9.0f);
     }
 }
 
@@ -1668,7 +1873,10 @@ void DrawSetupTab(Gdiplus::Graphics& g) {
     Text(g, L"CALIBRATION", gFontLabel, ui::kText, RectF(34, 140, 300, 16));
     if (calibrating) {
         const wchar_t* banner = (gCalibrationTarget == CalibrationTarget::CastPoint)
-            ? L"CLICK the spot to cast at" : L"DRAG a box over the region";
+            ? L"CLICK the spot to cast at"
+            : (gCalibrationTarget == CalibrationTarget::CollectRegion)
+                ? L"DRAG a box where \"<item> x1\" appears"
+                : L"DRAG a box over the region";
         Text(g, banner, gFontBody, ui::kWarn, RectF(34, 158, 310, 18));
         Text(g, L"Esc cancels", gFontSmall, ui::kMuted, RectF(34, 177, 310, 15));
     } else {
@@ -1696,19 +1904,16 @@ void DrawSetupTab(Gdiplus::Graphics& g) {
     DrawCalibrationRow(g, 382, L"Exit button", line, exitSet, kHitCalExit,
                        calibrating && gCalibrationTarget == CalibrationTarget::ExitRegion);
 
-    // Minigame log toggle.
-    DrawCard(g, RectF(18, 466, 344, 70));
-    RowLabel(g, 480, L"Minigame log", L"CSV per minigame in logs\\ (for tuning)");
-    {
-        const RectF track(300, 489, 46, 24);
-        const bool on = gMinigameLog.load();
-        if (on) FillGradient(g, track, 12.0f);
-        else FillInset(g, track, 12.0f);
-        Gdiplus::SolidBrush knob(on ? ui::kText : ui::kMuted);
-        g.FillEllipse(&knob, RectF(on ? 325.0f : 303.0f, 492.0f, 18.0f, 18.0f));
-        HoverOverlay(g, RectF(296, 485, 54, 32), 14.0f, kHitLogToggle);
-        AddHit(RectF(262, 476, 94, 50), kHitLogToggle);
+    const RECT collect = GetCollectRect();
+    const bool collectSet = RectCalibrated(collect);
+    if (collectSet) {
+        swprintf_s(line, L"%ldx%ld at (%ld, %ld)", collect.right - collect.left,
+                   collect.bottom - collect.top, collect.left, collect.top);
+    } else {
+        swprintf_s(line, L"NOT SET · box the item message");
     }
+    DrawCalibrationRow(g, 466, L"Collect message", line, collectSet, kHitCalCollect,
+                       calibrating && gCalibrationTarget == CalibrationTarget::CollectRegion);
 }
 
 void PaintHud(HWND hwnd) {
@@ -1758,9 +1963,9 @@ void PaintHud(HWND hwnd) {
 
         // Segmented tab bar.
         DrawCard(g, RectF(18, 72, 344, 42));
-        const wchar_t* tabs[3] = {L"Fishing", L"Hotkeys", L"Setup"};
-        for (int i = 0; i < 3; ++i) {
-            const RectF seg(22.0f + i * 112.0f, 76.0f, 112.0f, 34.0f);
+        const wchar_t* tabs[4] = {L"Fishing", L"Settings", L"Hotkeys", L"Setup"};
+        for (int i = 0; i < 4; ++i) {
+            const RectF seg(22.0f + i * 84.0f, 76.0f, 84.0f, 34.0f);
             const int id = kHitTab0 + i;
             if (gActiveTab == i) FillGradient(g, seg, 11.0f);
             else HoverOverlay(g, seg, 11.0f, id);
@@ -1769,7 +1974,8 @@ void PaintHud(HWND hwnd) {
         }
 
         if (gActiveTab == 0) DrawFishingTab(g, t);
-        else if (gActiveTab == 1) DrawHotkeysTab(g);
+        else if (gActiveTab == 1) DrawSettingsTab(g);
+        else if (gActiveTab == 2) DrawHotkeysTab(g);
         else DrawSetupTab(g);
     }
 
@@ -1853,7 +2059,8 @@ LRESULT CALLBACK CalibrationMouseProc(int code, WPARAM wParam, LPARAM lParam) {
     }
 
     if (gCalibrationTarget == CalibrationTarget::BarRegion ||
-        gCalibrationTarget == CalibrationTarget::ExitRegion) {
+        gCalibrationTarget == CalibrationTarget::ExitRegion ||
+        gCalibrationTarget == CalibrationTarget::CollectRegion) {
         if (wParam == WM_LBUTTONDOWN) {
             gDragStart = pt;
             gDragging = true;
@@ -1865,7 +2072,8 @@ LRESULT CALLBACK CalibrationMouseProc(int code, WPARAM wParam, LPARAM lParam) {
                              std::max(gDragStart.x, pt.x), std::max(gDragStart.y, pt.y)};
             if (RectCalibrated(rect)) {
                 if (gCalibrationTarget == CalibrationTarget::BarRegion) SetBarRect(rect);
-                else SetExitRect(rect);
+                else if (gCalibrationTarget == CalibrationTarget::ExitRegion) SetExitRect(rect);
+                else SetCollectRect(rect);
                 PostMessage(gWindow, WM_CALIBRATION_DONE, 0, 0);
             }
             // Too small to be a real drag (likely an accidental click) -
@@ -1984,6 +2192,10 @@ void LoadSettings() {
             static_cast<UINT>(kDefaultCollectDelayMs / 1000), path.c_str())) * 1000ULL,
         kMaxCollectDelayMs));
     gMinigameLog.store(GetPrivateProfileIntW(L"Debug", L"MinigameLog", 0, path.c_str()) != 0);
+    gHoldKeyMs.store(std::clamp<ULONGLONG>(
+        static_cast<ULONGLONG>(GetPrivateProfileIntW(L"Fishing", L"HoldKeySeconds",
+            static_cast<UINT>(kDefaultHoldKeyMs / 1000), path.c_str())) * 1000ULL,
+        kMinHoldKeyMs, kMaxHoldKeyMs));
     const UINT correctionVk = GetPrivateProfileIntW(L"Keys", L"CorrectionVk", '1', path.c_str());
     const UINT rodVk = GetPrivateProfileIntW(L"Keys", L"RodVk", '5', path.c_str());
     if (correctionVk > 0 && correctionVk <= 0xFF) gCorrectionKeyVk.store(static_cast<WORD>(correctionVk));
@@ -2011,6 +2223,12 @@ void LoadSettings() {
                      ReadIntSetting(L"Calibration", L"ExitRight", 0, path),
                      ReadIntSetting(L"Calibration", L"ExitBottom", 0, path)};
     if (RectCalibrated(exit)) SetExitRect(exit);
+
+    const RECT collect{ReadIntSetting(L"Calibration", L"CollectLeft", 0, path),
+                       ReadIntSetting(L"Calibration", L"CollectTop", 0, path),
+                       ReadIntSetting(L"Calibration", L"CollectRight", 0, path),
+                       ReadIntSetting(L"Calibration", L"CollectBottom", 0, path)};
+    if (RectCalibrated(collect)) SetCollectRect(collect);
 }
 
 void SaveSettings() {
@@ -2025,6 +2243,7 @@ void SaveSettings() {
     WriteIntSetting(L"Fishing", L"AutoRespawn", gAutoRespawn.load() ? 1 : 0, path);
     WriteIntSetting(L"Fishing", L"RespawnEveryCatches", gRespawnEveryCatches.load(), path);
     WriteIntSetting(L"Fishing", L"CollectDelaySeconds", static_cast<int>(gCollectDelayMs.load() / 1000), path);
+    WriteIntSetting(L"Fishing", L"HoldKeySeconds", static_cast<int>(gHoldKeyMs.load() / 1000), path);
     WriteIntSetting(L"Debug", L"MinigameLog", gMinigameLog.load() ? 1 : 0, path);
     WriteIntSetting(L"Keys", L"CorrectionVk", gCorrectionKeyVk.load(), path);
     WriteIntSetting(L"Keys", L"RodVk", gRodKeyVk.load(), path);
@@ -2044,6 +2263,12 @@ void SaveSettings() {
     WriteIntSetting(L"Calibration", L"ExitTop", exit.top, path);
     WriteIntSetting(L"Calibration", L"ExitRight", exit.right, path);
     WriteIntSetting(L"Calibration", L"ExitBottom", exit.bottom, path);
+
+    const RECT collect = GetCollectRect();
+    WriteIntSetting(L"Calibration", L"CollectLeft", collect.left, path);
+    WriteIntSetting(L"Calibration", L"CollectTop", collect.top, path);
+    WriteIntSetting(L"Calibration", L"CollectRight", collect.right, path);
+    WriteIntSetting(L"Calibration", L"CollectBottom", collect.bottom, path);
 }
 
 void ApplyToggleHotkey(WORD vk) {
@@ -2105,7 +2330,8 @@ void EndHotkeyBind() {
 
 void SetActiveTab(int tab) {
     gActiveTab = tab;
-    const int show = (tab == 0) ? SW_SHOW : SW_HIDE;
+    const int show = (tab == 1) ? SW_SHOW : SW_HIDE;
+    if (gHoldKeyEdit) ShowWindow(gHoldKeyEdit, show);
     if (gWaitFishEdit) ShowWindow(gWaitFishEdit, show);
     if (gRespawnEdit) ShowWindow(gRespawnEdit, show);
     if (gCollectEdit) ShowWindow(gCollectEdit, show);
@@ -2145,6 +2371,20 @@ void UpdateCollectDelaySetting() {
     SaveSettings();
 }
 
+void UpdateHoldKeySetting() {
+    wchar_t buf[32]{};
+    GetWindowTextW(gHoldKeyEdit, buf, 32);
+    wchar_t* end = nullptr;
+    const unsigned long value = wcstoul(buf, &end, 10);
+    if (end != buf) {
+        gHoldKeyMs.store(std::clamp<ULONGLONG>(static_cast<ULONGLONG>(value) * 1000ULL,
+                                               kMinHoldKeyMs, kMaxHoldKeyMs));
+    }
+    swprintf_s(buf, L"%u", static_cast<unsigned>(gHoldKeyMs.load() / 1000));
+    SetWindowTextW(gHoldKeyEdit, buf);
+    SaveSettings();
+}
+
 void UpdateRespawnEverySetting() {
     wchar_t buf[32]{};
     GetWindowTextW(gRespawnEdit, buf, 32);
@@ -2161,7 +2401,7 @@ void UpdateRespawnEverySetting() {
 
 void HandleHit(HWND hwnd, int id) {
     switch (id) {
-        case kHitTab0: case kHitTab1: case kHitTab2:
+        case kHitTab0: case kHitTab1: case kHitTab2: case kHitTab3:
             SetActiveTab(id - kHitTab0);
             break;
         case kHitStart:
@@ -2206,6 +2446,10 @@ void HandleHit(HWND hwnd, int id) {
             if (gCalibrating.load() && gCalibrationTarget == CalibrationTarget::BarRegion) EndCalibration();
             else StartCalibration(CalibrationTarget::BarRegion);
             break;
+        case kHitCalCollect:
+            if (gCalibrating.load() && gCalibrationTarget == CalibrationTarget::CollectRegion) EndCalibration();
+            else StartCalibration(CalibrationTarget::CollectRegion);
+            break;
         case kHitCalExit:
             if (gCalibrating.load() && gCalibrationTarget == CalibrationTarget::ExitRegion) EndCalibration();
             else StartCalibration(CalibrationTarget::ExitRegion);
@@ -2228,11 +2472,15 @@ HWND CreateNumberEdit(HWND parent, int id, int x, int y) {
 LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lParam) {
     switch (message) {
         case WM_CREATE: {
-            // Positioned over the inset boxes drawn in DrawFishingTab.
-            gWaitFishEdit = CreateNumberEdit(hwnd, ID_WAIT_FISH_EDIT, 272, 337);
-            gCollectEdit = CreateNumberEdit(hwnd, ID_COLLECT_EDIT, 272, 381);
-            gRespawnEdit = CreateNumberEdit(hwnd, ID_RESPAWN_EDIT, 272, 469);
+            // Positioned over the inset boxes drawn in DrawSettingsTab.
+            const auto editY = [](int row) { return static_cast<int>(SettingsRowY(row)) + 9; };
+            gWaitFishEdit = CreateNumberEdit(hwnd, ID_WAIT_FISH_EDIT, 272, editY(0));
+            gCollectEdit = CreateNumberEdit(hwnd, ID_COLLECT_EDIT, 272, editY(1));
+            gHoldKeyEdit = CreateNumberEdit(hwnd, ID_HOLD_EDIT, 272, editY(2));
+            gRespawnEdit = CreateNumberEdit(hwnd, ID_RESPAWN_EDIT, 272, editY(4));
             wchar_t buf[32];
+            swprintf_s(buf, L"%u", static_cast<unsigned>(gHoldKeyMs.load() / 1000));
+            SetWindowTextW(gHoldKeyEdit, buf);
             swprintf_s(buf, L"%u", static_cast<unsigned>(gCollectDelayMs.load() / 1000));
             SetWindowTextW(gCollectEdit, buf);
             swprintf_s(buf, L"%u", static_cast<unsigned>(gWaitForFishMs.load() / 1000));
@@ -2250,6 +2498,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         case WM_COMMAND:
             if (LOWORD(wParam) == ID_WAIT_FISH_EDIT && HIWORD(wParam) == EN_KILLFOCUS) {
                 UpdateWaitForFishSetting();
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            if (LOWORD(wParam) == ID_HOLD_EDIT && HIWORD(wParam) == EN_KILLFOCUS) {
+                UpdateHoldKeySetting();
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
             if (LOWORD(wParam) == ID_COLLECT_EDIT && HIWORD(wParam) == EN_KILLFOCUS) {
