@@ -896,7 +896,13 @@ int ClassifyRarity(const CaptureSurface& surface, const std::vector<uint32_t>& b
             ReadRgb(now, r1, g1, b1);
             ReadRgb(base, r0, g0, b0);
             const bool changed = std::max({std::abs(r1 - r0), std::abs(g1 - g0), std::abs(b1 - b0)}) >= 40;
-            const int bucket = changed ? RarityBucket(now) : -1;
+            int bucket = changed ? RarityBucket(now) : -1;
+            // The banner is a translucent dark panel: over water its whole
+            // interior turns into a long darker-blue strip that beat the real
+            // (coloured) border and made Legendary/Common read as Rare. A
+            // pixel with the same colour family as what was behind it that
+            // only got darker is background seen through the panel - skip it.
+            if (bucket >= 0 && bucket == RarityBucket(base) && Luma(now) < Luma(base) + 25) bucket = -1;
             run = (bucket >= 0 && bucket == prev) ? run + 1 : (bucket >= 0 ? 1 : 0);
             prev = bucket;
             if (bucket >= 0 && run > runOut) {
@@ -910,6 +916,39 @@ int ClassifyRarity(const CaptureSurface& surface, const std::vector<uint32_t>& b
     // so without a line over 30% of the width the banner is grey: Common.
     if (runOut < std::max(12, w * 3 / 10)) return kRarityCommon;
     return best;
+}
+
+// <exe dir>\logs (created if needed).
+std::wstring LogsDir() {
+    wchar_t modulePath[MAX_PATH];
+    const DWORD len = GetModuleFileNameW(nullptr, modulePath, MAX_PATH);
+    std::wstring dir(modulePath, (len > 0 && len < MAX_PATH) ? len : 0);
+    dir = dir.substr(0, dir.find_last_of(L"\\/") + 1) + L"logs";
+    CreateDirectoryW(dir.c_str(), nullptr);
+    return dir;
+}
+
+// Writes 32-bit top-down pixels as a .bmp (for the collect-message debug
+// captures: the rarity colours over water need real samples to tune).
+void SaveBmp(const std::wstring& path, const uint32_t* pixels, int w, int h) {
+    FILE* f = _wfopen(path.c_str(), L"wb");
+    if (!f) return;
+    BITMAPINFOHEADER bi{};
+    bi.biSize = sizeof(bi);
+    bi.biWidth = w;
+    bi.biHeight = -h; // top-down, same order as CaptureSurface
+    bi.biPlanes = 1;
+    bi.biBitCount = 32;
+    bi.biCompression = BI_RGB;
+    bi.biSizeImage = static_cast<DWORD>(w) * h * 4;
+    BITMAPFILEHEADER bf{};
+    bf.bfType = 0x4D42; // "BM"
+    bf.bfOffBits = sizeof(bf) + sizeof(bi);
+    bf.bfSize = bf.bfOffBits + bi.biSizeImage;
+    fwrite(&bf, sizeof(bf), 1, f);
+    fwrite(&bi, sizeof(bi), 1, f);
+    fwrite(pixels, 4, static_cast<size_t>(w) * h, f);
+    fclose(f);
 }
 
 // One CSV per minigame (Setup tab -> Minigame log), for tuning the control.
@@ -1027,12 +1066,14 @@ DWORD WINAPI TrackerThread(void*) {
     int lastRarity = -1;
     int attemptRarity = kRarityCommon; // best classification during this attempt
     int attemptRarityRun = -1;
+    std::vector<uint32_t> attemptRarityFrame; // frame the rarity was read from (debug capture)
     // Snapshot of the collect-message region right before T goes down.
     auto takeCollectBaseline = [&]() {
         collectSeen = false;
         collectHitSinceMs = -1.0;
         attemptRarity = kRarityCommon;
         attemptRarityRun = -1;
+        attemptRarityFrame.clear();
         collectBaseline.clear();
         if (collectReady && collectSurface.Grab(collectRect.left, collectRect.top)) {
             collectBaseline.assign(collectSurface.pixels,
@@ -1056,6 +1097,9 @@ DWORD WINAPI TrackerThread(void*) {
             if (run > attemptRarityRun) {
                 attemptRarityRun = run;
                 attemptRarity = rarity;
+                if (gMinigameLog.load()) {
+                    attemptRarityFrame.assign(collectSurface.pixels, collectSurface.pixels + area);
+                }
             }
         } else if (!collectSeen) {
             collectHitSinceMs = -1.0;
@@ -1475,6 +1519,21 @@ DWORD WINAPI TrackerThread(void*) {
                     if (checking) {
                         lastRarity = attemptRarity;
                         ++rarityCounts[attemptRarity];
+                        const int area = collectSurface.width * collectSurface.height;
+                        if (gMinigameLog.load() && static_cast<int>(attemptRarityFrame.size()) == area &&
+                            static_cast<int>(collectBaseline.size()) == area) {
+                            SYSTEMTIME st;
+                            GetLocalTime(&st);
+                            wchar_t name[96];
+                            swprintf_s(name, L"\\collect_%04u%02u%02u_%02u%02u%02u_%s",
+                                       st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
+                                       kRarityNames[attemptRarity]);
+                            const std::wstring base = LogsDir() + name;
+                            SaveBmp(base + L"_before.bmp", collectBaseline.data(),
+                                    collectSurface.width, collectSurface.height);
+                            SaveBmp(base + L"_message.bmp", attemptRarityFrame.data(),
+                                    collectSurface.width, collectSurface.height);
+                        }
                     }
                 }
                 else ++failedCollects;
@@ -1907,7 +1966,7 @@ void DrawSettingsTab(Gdiplus::Graphics& g) {
                               L"seconds T is held to collect",
                               L"reset character (Esc · R · Enter)",
                               L"minigames (also after 2 missed casts)",
-                              L"CSV per minigame in logs\\ (for tuning)"};
+                              L"CSV + item captures in logs\\ (tuning)"};
     for (int row = 0; row < 6; ++row) {
         const float y = SettingsRowY(row);
         if (row > 0) Divider(g, y - 3.0f);
