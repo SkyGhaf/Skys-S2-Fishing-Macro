@@ -2289,7 +2289,7 @@ void DrawSetupTab(Gdiplus::Graphics& g) {
 // Auto bait buy page. The two EDIT controls sit on the inset boxes of the
 // amount card (created in WM_CREATE at kBaitRowY + 9).
 constexpr float kBaitAmountRowY = 206.0f;
-constexpr float kBaitDelayRowY = 250.0f;
+constexpr float kBaitDelayRowY = 290.0f;
 const int kBaitPresets[5] = {99, 198, 495, 990, 1980};
 
 void DrawBaitTab(Gdiplus::Graphics& g) {
@@ -2318,23 +2318,24 @@ void DrawBaitTab(Gdiplus::Graphics& g) {
     }
 
     // --- Amount / delay / presets -----------------------------------------------
-    DrawCard(g, RectF(18, 200, 344, 126));
+    // Amount row with its presets right below it, then the click delay.
+    DrawCard(g, RectF(18, 200, 344, 136));
     RowLabel(g, kBaitAmountRowY, L"Bait to buy", L"rounded up to 99 per purchase");
     FillInset(g, RectF(266, kBaitAmountRowY + 5, 80, 30), 9.0f);
     Divider(g, kBaitDelayRowY - 3);
     RowLabel(g, kBaitDelayRowY, L"Click delay", L"ms to wait after each click");
     FillInset(g, RectF(266, kBaitDelayRowY + 5, 80, 30), 9.0f);
     for (int i = 0; i < 5; ++i) {
-        const RectF chip(34.0f + i * 63.0f, 292.0f, 58.0f, 26.0f);
+        const RectF chip(34.0f + i * 63.0f, kBaitAmountRowY + 46.0f, 58.0f, 26.0f);
         swprintf_s(line, L"%d", kBaitPresets[i]);
         if (gBaitAmount.load() == kBaitPresets[i]) GradientButton(g, chip, line, kHitBaitPreset0 + i, 13.0f);
         else InsetButton(g, chip, line, kHitBaitPreset0 + i, ui::kSoft, 13.0f);
     }
 
     // --- Click points -------------------------------------------------------------
-    DrawCard(g, RectF(18, 338, 344, 7 * 28 + 12));
+    DrawCard(g, RectF(18, 346, 344, 7 * 28 + 10));
     for (int i = 0; i < kBaitClicks; ++i) {
-        const float y = 344.0f + i * 28.0f;
+        const float y = 351.0f + i * 28.0f;
         const bool active = running && gBaitClick.load() == i + 1;
         swprintf_s(line, L"%d", i + 1);
         Text(g, line, gFontLabel, active ? ui::kGradA : ui::kMuted, RectF(32, y, 14, 26));
@@ -2351,7 +2352,7 @@ void DrawBaitTab(Gdiplus::Graphics& g) {
     }
 
     // --- Start / stop -----------------------------------------------------------------
-    const RectF startR(18, 552, 344, 46);
+    const RectF startR(18, 562, 344, 42);
     if (running) {
         DrawCard(g, startR);
         HoverOverlay(g, startR, 14.0f, kHitBaitStart);
