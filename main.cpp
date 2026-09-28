@@ -854,23 +854,26 @@ int CollectMessageScore(const CaptureSurface& surface, const std::vector<uint32_
 
 // Rarity of a collected item, read from the thin coloured line along the top
 // of the message's banner: red = Mythic, gold = Legendary, blue = Rare,
-// grey = Common. The banner is translucent, so that line's on-screen colour
-// depends on what is behind it (brown deck vs grey-blue water/sky); it is
-// matched against samples measured from 64 real collects, per background.
+// grey = Common. The banner is translucent, so on screen that line is mixed
+// with whatever is behind it (deck, water, sky, darker at night). The
+// background is known from the pre-T snapshot, so it is subtracted out:
+//   seen = a * line + (1 - a) * background  ->  line = (seen - (1 - a) * bg) / a
+// a = 0.30 and the true line colours below were fitted on 69 labelled real
+// collects (69/69 correct, also leave-one-out). A fixed deck/water split
+// failed on a darker deck, which read as "water" and turned Rares into Mythic.
 enum Rarity { kRarityMythic = 0, kRarityLegendary, kRarityRare, kRarityCommon, kRarityCount };
 const wchar_t* const kRarityNames[kRarityCount] = {L"Mythic", L"Legendary", L"Rare", L"Common"};
 
-struct RarityPrototype {
-    int rarity;
-    bool water; // background type the sample was taken over
-    int r, g, b;
+constexpr double kBannerAlpha = 0.30;
+const int kRarityLineColour[kRarityCount][3] = {
+    {115, -4, 2},    // Mythic: red
+    {192, 152, 38},  // Legendary: gold
+    {48, 137, 185},  // Rare: blue
+    {160, 164, 145}, // Common: grey
 };
-const RarityPrototype kRarityPrototypes[] = {
-    {kRarityCommon, false, 114, 92, 66},    {kRarityLegendary, false, 120, 86, 32},
-    {kRarityMythic, false, 98, 38, 23},     {kRarityRare, false, 77, 81, 75},
-    {kRarityCommon, true, 110, 112, 114},   {kRarityLegendary, true, 126, 113, 83},
-    {kRarityMythic, true, 108, 69, 76},     {kRarityRare, true, 85, 111, 135},
-};
+// A real banner line scores 20+; glare without a banner (e.g. the character's
+// lantern light) scores ~0.
+constexpr double kMinBannerLineScore = 8.0;
 
 // Median colour of one row, skipping the left quarter (item icon) and the
 // white text. False if too few pixels remain.
@@ -913,11 +916,12 @@ double LineStrength(const uint32_t* px, int w, int h, int y, int colour[3]) {
 
 // frame = the clearest capture of the message, baseline = same region just
 // before T. Finds the banner's top line (a line that is new compared to the
-// baseline) and returns the nearest rarity sample for that background.
+// baseline), removes the background from its colour and returns the nearest
+// rarity - or -1 if there is no banner line at all (not an item message).
 int ClassifyRarity(const std::vector<uint32_t>& frame, const std::vector<uint32_t>& baseline, int w, int h) {
     if (w <= 0 || h <= 4 || static_cast<int>(frame.size()) != w * h ||
         static_cast<int>(baseline.size()) != w * h) {
-        return kRarityCommon;
+        return -1;
     }
     double bestScore = -1e9;
     int bestY = -1;
@@ -934,17 +938,22 @@ int ClassifyRarity(const std::vector<uint32_t>& frame, const std::vector<uint32_
         }
     }
     int background[3];
-    if (bestY < 0 || !RowMedian(baseline.data(), w, bestY, background)) return kRarityCommon;
-    const bool water = !(background[0] > background[2] + 15); // brown deck is clearly red > blue
+    if (bestY < 0 || bestScore < kMinBannerLineScore ||
+        !RowMedian(baseline.data(), w, bestY, background)) {
+        return -1;
+    }
+    int line[3];
+    for (int c = 0; c < 3; ++c) {
+        line[c] = static_cast<int>(std::lround((bestColour[c] - (1.0 - kBannerAlpha) * background[c]) /
+                                               kBannerAlpha));
+    }
     int best = kRarityCommon;
     double bestDistance = 1e9;
-    for (const RarityPrototype& proto : kRarityPrototypes) {
-        if (proto.water != water) continue;
-        const int sample[3] = {proto.r, proto.g, proto.b};
-        const double d = ColourDistance(bestColour, sample);
+    for (int rarity = 0; rarity < kRarityCount; ++rarity) {
+        const double d = ColourDistance(line, kRarityLineColour[rarity]);
         if (d < bestDistance) {
             bestDistance = d;
-            best = proto.rarity;
+            best = rarity;
         }
     }
     return best;
@@ -1165,6 +1174,23 @@ DWORD WINAPI TrackerThread(void*) {
         } else if (!collectSeen) {
             collectHitSinceMs = -1.0;
         }
+    };
+    // Minigame log on: saves the pre-T snapshot and a frame of the collect
+    // region as logs\collect_<time>_<tag>_before/_message.bmp.
+    auto saveCollectCapture = [&](const wchar_t* tag, const std::vector<uint32_t>& frame) {
+        const int w = collectSurface.width, h = collectSurface.height;
+        if (!gMinigameLog.load() || static_cast<int>(frame.size()) != w * h ||
+            static_cast<int>(collectBaseline.size()) != w * h) {
+            return;
+        }
+        SYSTEMTIME st;
+        GetLocalTime(&st);
+        wchar_t name[128];
+        swprintf_s(name, L"\\collect_%04u%02u%02u_%02u%02u%02u_%s",
+                   st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond, tag);
+        const std::wstring base = LogsDir() + name;
+        SaveBmp(base + L"_before.bmp", collectBaseline.data(), w, h);
+        SaveBmp(base + L"_message.bmp", frame.data(), w, h);
     };
 
 
@@ -1555,6 +1581,15 @@ DWORD WINAPI TrackerThread(void*) {
                 if (collectSeen) {
                     outcome = 1;
                 } else if (now - phaseChangedAt >= kCollectVerifyMs) {
+                    // Keep a picture of every attempt without a message, so a
+                    // missed item (e.g. an ORE) can be checked afterwards.
+                    if (gMinigameLog.load() && collectSurface.Grab(collectRect.left, collectRect.top)) {
+                        const std::vector<uint32_t> last(collectSurface.pixels,
+                            collectSurface.pixels + collectSurface.width * collectSurface.height);
+                        wchar_t tag[32];
+                        swprintf_s(tag, L"NOITEM_try%d", collectAttempt + 1);
+                        saveCollectCapture(tag, last);
+                    }
                     if (collectAttempt < kCollectRetries) {
                         // The swinging fish probably cancelled the pickup -
                         // it is usually still hanging there, so hold T again.
@@ -1577,31 +1612,26 @@ DWORD WINAPI TrackerThread(void*) {
                 // Only a detected item message counts as a catch; the
                 // reposition counter counts every minigame, since the drift
                 // happens either way.
+                if (outcome == 1 && checking) {
+                    attemptRarity = ClassifyRarity(attemptRarityFrame, collectBaseline,
+                                                   collectSurface.width, collectSurface.height);
+                    if (attemptRarity < 0) {
+                        // Bright pixels but no banner line: glare (e.g. the
+                        // character's lantern), not an item message.
+                        saveCollectCapture(L"NOITEM_glare", attemptRarityFrame);
+                        outcome = 0;
+                    }
+                }
                 if (outcome == 1) {
                     ++totalCatches;
                     if (checking) {
-                        attemptRarity = ClassifyRarity(attemptRarityFrame, collectBaseline,
-                                                       collectSurface.width, collectSurface.height);
                         lastRarity = attemptRarity;
                         ++rarityCounts[attemptRarity];
                         lastWasOre = attemptRarity == kRarityMythic &&
                             IsOreMessage(attemptRarityFrame, collectSurface.width, collectSurface.height);
                         if (lastWasOre) ++oreCount;
-                        const int area = collectSurface.width * collectSurface.height;
-                        if (gMinigameLog.load() && static_cast<int>(attemptRarityFrame.size()) == area &&
-                            static_cast<int>(collectBaseline.size()) == area) {
-                            SYSTEMTIME st;
-                            GetLocalTime(&st);
-                            wchar_t name[96];
-                            swprintf_s(name, L"\\collect_%04u%02u%02u_%02u%02u%02u_%s",
-                                       st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
-                                       lastWasOre ? L"ORE" : kRarityNames[attemptRarity]);
-                            const std::wstring base = LogsDir() + name;
-                            SaveBmp(base + L"_before.bmp", collectBaseline.data(),
-                                    collectSurface.width, collectSurface.height);
-                            SaveBmp(base + L"_message.bmp", attemptRarityFrame.data(),
-                                    collectSurface.width, collectSurface.height);
-                        }
+                        saveCollectCapture(lastWasOre ? L"ORE" : kRarityNames[attemptRarity],
+                                           attemptRarityFrame);
                     }
                 }
                 else {
