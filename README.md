@@ -20,6 +20,9 @@ on your own screen, so it runs at any resolution.
   Only a seen message counts as a catch; otherwise it counts as *no item* (the pickup failed, or the game gave nothing - the two look the same on screen). The Fishing tab
   shows catches, no-item count and the success rate. Calibrate the **Collect message** box in the
   Setup tab. Without it, every collect counts as a catch.
+- **Rarity counter:** each collected item is sorted by the colour of its message banner:
+  Mythic (red), Gold, Green, Blue, Purple, or Other when there is no clear colour. The counts
+  show on the Fishing tab.
 - **Equip on start:** every time you press Start it quickly taps the *correction key* (default
   `1`) and then the *rod key* (default `5`). You can change both in the **Hotkeys** tab.
 - **Collect delay / Hold T time:** choose how long to wait after the minigame before holding **T**,

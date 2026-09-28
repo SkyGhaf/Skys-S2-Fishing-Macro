@@ -150,6 +150,8 @@ struct Telemetry {
     int collectAttempt = 0;       // 0-based try of the current collect
     int lastCollectDetected = -1; // -1 no check yet, 0 not found, 1 detected
     bool collectCheckReady = false;
+    int rarityCounts[6] = {}; // indexed by Rarity (kRarityCount)
+    int lastRarity = -1;
     int confidence = 0;
     ControlState state = ControlState::Paused;
     Phase phase = Phase::Cast;
@@ -848,6 +850,67 @@ int CollectMessageScore(const CaptureSurface& surface, const std::vector<uint32_
     return score;
 }
 
+// Rarity of a collected item, read from the colour of the message's banner
+// border (a long horizontal line behind the name: blue for Clown Fish, gold
+// for Crustadon, red for Mythic items like Lost Mask). Only red is a known
+// rarity name so far; the rest are labelled by colour.
+enum Rarity { kRarityMythic = 0, kRarityGold, kRarityGreen, kRarityBlue, kRarityPurple, kRarityOther,
+              kRarityCount };
+const wchar_t* const kRarityNames[kRarityCount] = {L"Mythic", L"Gold", L"Green", L"Blue", L"Purple", L"Other"};
+
+// Colour bucket of a saturated pixel, or -1 for grey/dark/white.
+int RarityBucket(uint32_t p) {
+    int r, g, b;
+    ReadRgb(p, r, g, b);
+    const int mx = std::max({r, g, b});
+    const int mn = std::min({r, g, b});
+    const int d = mx - mn;
+    if (mx < 56 || d * 100 < mx * 35) return -1; // too dark or not saturated
+    double h;
+    if (mx == r) h = 60.0 * std::fmod(static_cast<double>(g - b) / d, 6.0);
+    else if (mx == g) h = 60.0 * (static_cast<double>(b - r) / d + 2.0);
+    else h = 60.0 * (static_cast<double>(r - g) / d + 4.0);
+    if (h < 0.0) h += 360.0;
+    if (h < 15.0 || h >= 335.0) return kRarityMythic;
+    if (h < 75.0) return kRarityGold;
+    if (h < 165.0) return kRarityGreen;
+    if (h < 255.0) return kRarityBlue;
+    return kRarityPurple;
+}
+
+// Longest horizontal run of one colour among pixels that are new since the
+// baseline (so blue water behind the message doesn't count). The banner
+// border spans most of the message; the item icon only gives short runs.
+// Returns the bucket and writes the run length.
+int ClassifyRarity(const CaptureSurface& surface, const std::vector<uint32_t>& baseline, int& runOut) {
+    runOut = 0;
+    const int w = surface.width;
+    if (static_cast<int>(baseline.size()) != w * surface.height) return kRarityOther;
+    int best = kRarityOther;
+    for (int y = 0; y < surface.height; ++y) {
+        int run = 0;
+        int prev = -1;
+        for (int x = 0; x < w; ++x) {
+            const uint32_t now = surface.pixels[y * w + x];
+            const uint32_t base = baseline[y * w + x];
+            int r1, g1, b1, r0, g0, b0;
+            ReadRgb(now, r1, g1, b1);
+            ReadRgb(base, r0, g0, b0);
+            const bool changed = std::max({std::abs(r1 - r0), std::abs(g1 - g0), std::abs(b1 - b0)}) >= 40;
+            const int bucket = changed ? RarityBucket(now) : -1;
+            run = (bucket >= 0 && bucket == prev) ? run + 1 : (bucket >= 0 ? 1 : 0);
+            prev = bucket;
+            if (bucket >= 0 && run > runOut) {
+                runOut = run;
+                best = bucket;
+            }
+        }
+    }
+    // A short run is just icon/text colour - no recognisable banner colour.
+    if (runOut < std::max(12, w / 5)) return kRarityOther;
+    return best;
+}
+
 // One CSV per minigame (Setup tab -> Minigame log), for tuning the control.
 struct MinigameLog {
     FILE* file = nullptr;
@@ -959,10 +1022,16 @@ DWORD WINAPI TrackerThread(void*) {
     std::vector<uint32_t> collectBaseline;
     bool collectSeen = false;
     double collectHitSinceMs = -1.0;
+    int rarityCounts[kRarityCount] = {};
+    int lastRarity = -1;
+    int attemptRarity = kRarityOther; // best classification during this attempt
+    int attemptRarityRun = -1;
     // Snapshot of the collect-message region right before T goes down.
     auto takeCollectBaseline = [&]() {
         collectSeen = false;
         collectHitSinceMs = -1.0;
+        attemptRarity = kRarityOther;
+        attemptRarityRun = -1;
         collectBaseline.clear();
         if (collectReady && collectSurface.Grab(collectRect.left, collectRect.top)) {
             collectBaseline.assign(collectSurface.pixels,
@@ -972,14 +1041,22 @@ DWORD WINAPI TrackerThread(void*) {
     // Looks for the item message; sets collectSeen once it has been visible
     // for kCollectConfirmMs.
     auto checkCollectMessage = [&](double nowMs) {
-        if (collectSeen || collectBaseline.empty()) return;
+        // Keeps watching after the message is confirmed (T is held for the
+        // full time anyway) so the rarity is read from its clearest frame.
+        if (collectBaseline.empty()) return;
         if (!collectSurface.Grab(collectRect.left, collectRect.top)) return;
         const int area = collectSurface.width * collectSurface.height;
         const int needed = std::max(20, area / 50); // 2% of the region
         if (CollectMessageScore(collectSurface, collectBaseline) >= needed) {
             if (collectHitSinceMs < 0.0) collectHitSinceMs = nowMs;
             if (nowMs - collectHitSinceMs >= kCollectConfirmMs) collectSeen = true;
-        } else {
+            int run = 0;
+            const int rarity = ClassifyRarity(collectSurface, collectBaseline, run);
+            if (run > attemptRarityRun) {
+                attemptRarityRun = run;
+                attemptRarity = rarity;
+            }
+        } else if (!collectSeen) {
             collectHitSinceMs = -1.0;
         }
     };
@@ -1041,6 +1118,8 @@ DWORD WINAPI TrackerThread(void*) {
         current.collectAttempt = collectAttempt;
         current.lastCollectDetected = lastCollectDetected;
         current.collectCheckReady = collectReady;
+        std::copy(rarityCounts, rarityCounts + kRarityCount, current.rarityCounts);
+        current.lastRarity = lastRarity;
         current.state =current.enabled ? ControlState::Waiting : ControlState::Paused;
 
         if (!current.enabled || !captureReady) {
@@ -1390,7 +1469,13 @@ DWORD WINAPI TrackerThread(void*) {
                 // Only a detected item message counts as a catch; the
                 // reposition counter counts every minigame, since the drift
                 // happens either way.
-                if (outcome == 1) ++totalCatches;
+                if (outcome == 1) {
+                    ++totalCatches;
+                    if (checking) {
+                        lastRarity = attemptRarity;
+                        ++rarityCounts[attemptRarity];
+                    }
+                }
                 else ++failedCollects;
                 if (checking) lastCollectDetected = outcome;
                 ++catchesSinceRespawn;
@@ -1411,6 +1496,8 @@ DWORD WINAPI TrackerThread(void*) {
                 current.totalCatches = totalCatches;
                 current.failedCollects = failedCollects;
                 current.lastCollectDetected = lastCollectDetected;
+                std::copy(rarityCounts, rarityCounts + kRarityCount, current.rarityCounts);
+                current.lastRarity = lastRarity;
                 current.catchesSinceRespawn = catchesSinceRespawn;
                 phaseChangedAt = GetTickCount64();
             }
@@ -1727,43 +1814,51 @@ void DrawFishingTab(Gdiplus::Graphics& g, const Telemetry& t) {
 
     const RectF resetTile(196, 322, 166, 76);
     DrawCard(g, resetTile);
-    if (gAutoRespawn.load()) {
-        FillGradient(g, resetTile, 14.0f);
-        Text(g, L"UNTIL RESET", gFontLabel, ui::kText, RectF(210, 332, 120, 16));
-        Text(g, L"auto reposition", gFontSmall, Gdiplus::Color(220, 255, 255, 255),
-             RectF(210, 347, 120, 14));
-        swprintf_s(line, L"%d / %d", t.catchesSinceRespawn, gRespawnEveryCatches.load());
-        Text(g, line, gFontBig, ui::kText, RectF(208, 362, 130, 32));
-        Gdiplus::SolidBrush white(ui::kText);
-        FillRound(g, white, RectF(342, 338, 4, 44), 2.0f);
-    } else {
-        Text(g, L"UNTIL RESET", gFontLabel, ui::kMuted, RectF(210, 332, 120, 16));
-        Text(g, L"auto reposition", gFontSmall, ui::kMuted, RectF(210, 347, 120, 14));
-        Text(g, L"OFF", gFontBig, ui::kMuted, RectF(208, 362, 130, 32));
-    }
+    const bool respawnOn = gAutoRespawn.load();
+    Text(g, L"UNTIL RESET", gFontLabel, respawnOn ? ui::kText : ui::kMuted, RectF(210, 332, 120, 16));
+    Text(g, L"auto reposition", gFontSmall, ui::kMuted, RectF(210, 347, 120, 14));
+    if (respawnOn) swprintf_s(line, L"%d / %d", t.catchesSinceRespawn, gRespawnEveryCatches.load());
+    else swprintf_s(line, L"OFF");
+    Text(g, line, gFontBig, respawnOn ? ui::kText : ui::kMuted, RectF(208, 362, 130, 32));
+    if (respawnOn) FillGradient(g, RectF(342, 338, 4, 44), 2.0f, true);
 
-    // --- Item check card --------------------------------------------------------
+    // --- Rarity card ---------------------------------------------------------------
     DrawCard(g, RectF(18, 410, 344, 92));
-    Text(g, L"ITEM CHECK", gFontLabel, ui::kText, RectF(34, 422, 300, 16));
+    Text(g, L"CATCHES BY RARITY", gFontLabel, ui::kText, RectF(34, 420, 180, 16));
     if (!t.collectCheckReady) {
-        Text(g, L"Off · calibrate \"Collect message\" in Setup", gFontBody, ui::kWarn,
-             RectF(34, 442, 312, 18));
-        Text(g, L"Until then every collect counts as a catch.", gFontSmall, ui::kMuted,
-             RectF(34, 464, 312, 15));
-    } else {
-        const wchar_t* last = t.lastCollectDetected == 1 ? L"Last collect: item message seen ✓"
-                            : t.lastCollectDetected == 0 ? L"Last collect: no item (failed / nothing)"
-                            : L"Waiting for the first collect";
-        Text(g, last, gFontBody, t.lastCollectDetected == 0 ? ui::kBad : ui::kSoft,
-             RectF(34, 442, 312, 18));
-        swprintf_s(line, L"No message → T is retried up to %d× before it counts as no item",
-                   kCollectRetries);
-        Text(g, line, gFontSmall, ui::kMuted, RectF(34, 464, 312, 15));
+        Text(g, L"item check off", gFontSmall, ui::kWarn, RectF(200, 420, 146, 16),
+             Gdiplus::StringAlignmentFar);
+    } else if (t.lastCollectDetected == 0) {
+        Text(g, L"last: no item", gFontSmall, ui::kBad, RectF(200, 420, 146, 16),
+             Gdiplus::StringAlignmentFar);
+    } else if (t.lastRarity >= 0) {
+        swprintf_s(line, L"last: %s \u2713", kRarityNames[t.lastRarity]);
+        Text(g, line, gFontSmall, ui::kSoft, RectF(200, 420, 146, 16), Gdiplus::StringAlignmentFar);
     }
-    FillInset(g, RectF(34, 484, 312, 6), 3.0f);
-    if (t.phase == Phase::HoldKey || t.phase == Phase::VerifyCollect) {
-        const float frac = std::clamp(static_cast<float>(t.collectAttempt + 1) / (kCollectRetries + 1), 0.0f, 1.0f);
-        FillGradient(g, RectF(34, 484, 312 * frac, 6), 3.0f);
+    {
+        const Gdiplus::Color dots[kRarityCount] = {
+            Gdiplus::Color(255, 248, 82, 82), Gdiplus::Color(255, 250, 190, 50),
+            Gdiplus::Color(255, 80, 220, 120), Gdiplus::Color(255, 70, 150, 255),
+            Gdiplus::Color(255, 170, 110, 255), Gdiplus::Color(255, 150, 150, 170)};
+        for (int i = 0; i < kRarityCount; ++i) {
+            const float cx = 34.0f + (i % 3) * 106.0f;
+            const float cy = 442.0f + (i / 3) * 28.0f;
+            const RectF chip(cx, cy, 98.0f, 24.0f);
+            FillInset(g, chip, 12.0f);
+            if (t.lastRarity == i && t.lastCollectDetected == 1) {
+                Gdiplus::Pen ring(dots[i], 1.5f);
+                Gdiplus::GraphicsPath path;
+                AddRoundRect(path, chip, 12.0f);
+                g.DrawPath(&ring, &path);
+            }
+            Gdiplus::SolidBrush dot(dots[i]);
+            g.FillEllipse(&dot, RectF(cx + 9.0f, cy + 8.0f, 8.0f, 8.0f));
+            Text(g, kRarityNames[i], gFontSmall, t.collectCheckReady ? ui::kSoft : ui::kMuted,
+                 RectF(cx + 22.0f, cy, 50.0f, 24.0f));
+            swprintf_s(line, L"%d", t.rarityCounts[i]);
+            Text(g, line, gFontLabel, ui::kText, RectF(cx + 60.0f, cy, 32.0f, 24.0f),
+                 Gdiplus::StringAlignmentFar);
+        }
     }
 
     // --- Buttons -------------------------------------------------------------
@@ -1782,7 +1877,7 @@ void DrawFishingTab(Gdiplus::Graphics& g, const Telemetry& t) {
                    RectF(18, 578, 344, 18));
     } else {
         const POINT cast = GetCastPoint();
-        swprintf_s(line, L"Cast point (%ld, %ld)  ·  v2.3", cast.x, cast.y);
+        swprintf_s(line, L"Cast point (%ld, %ld)  ·  v2.4", cast.x, cast.y);
         TextCenter(g, line, gFontSmall, ui::kMuted, RectF(18, 578, 344, 18));
     }
 }
