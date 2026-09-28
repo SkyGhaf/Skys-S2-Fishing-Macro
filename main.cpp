@@ -53,6 +53,7 @@ constexpr int ID_BAIT_AMOUNT_EDIT = 1014;
 constexpr int ID_BAIT_DELAY_EDIT = 1015;
 constexpr int HOTKEY_TOGGLE = 1;
 constexpr int HOTKEY_QUIT = 2;
+constexpr int HOTKEY_BAIT = 4; // Auto Bait start/stop
 // Shared by both "Calibrate Start Point" and the hotkey binder: whichever
 // capture is in progress, Esc cancels it.
 constexpr int HOTKEY_CANCEL_CAPTURE = 3;
@@ -218,6 +219,7 @@ constexpr WORD kHoldKeyVk = static_cast<WORD>('T');
 // The Start/Pause and Exit hotkeys, rebindable from the Keystrokes tab.
 std::atomic<WORD> gToggleHotkeyVk{static_cast<WORD>(VK_F6)};
 std::atomic<WORD> gQuitHotkeyVk{static_cast<WORD>(VK_F8)};
+std::atomic<WORD> gBaitHotkeyVk{static_cast<WORD>(VK_F3)};
 std::atomic<bool> gBindingHotkey{false};
 int gBindingTarget = 0; // 0 = none, 1 = Start/Pause, 2 = Exit (UI thread only)
 WORD gCapturedVk = 0;   // set by the hook, read once WM_KEYBIND_DONE arrives
@@ -1833,7 +1835,7 @@ enum HitId {
     kHitNone = 0,
     kHitTab0 = 1, kHitTab1, kHitTab2, kHitTab3, kHitTab4,
     kHitStart = 10, kHitExit, kHitClose, kHitRespawnToggle, kHitMinimize,
-    kHitBindToggle = 20, kHitBindQuit, kHitBindCorrection, kHitBindRod,
+    kHitBindToggle = 20, kHitBindQuit, kHitBindCorrection, kHitBindRod, kHitBindBait,
     kHitCalCast = 30, kHitCalBar, kHitCalExit, kHitLogToggle, kHitCalCollect,
     kHitBaitStart = 40, kHitBaitPreset0, // presets: kHitBaitPreset0 + 0..4
     kHitBaitCal0 = 50,                   // calibration: kHitBaitCal0 + 0..6
@@ -2193,9 +2195,9 @@ void DrawSettingsTab(Gdiplus::Graphics& g) {
 
 void DrawKeyRow(Gdiplus::Graphics& g, float y, const wchar_t* title, const wchar_t* sub,
                 const std::wstring& key, int id, bool binding) {
-    DrawCard(g, RectF(18, y, 344, 58));
-    RowLabel(g, y + 9, title, sub);
-    const RectF chip(236, y + 11, 110, 36);
+    DrawCard(g, RectF(18, y, 344, 52));
+    RowLabel(g, y + 6, title, sub);
+    const RectF chip(236, y + 8, 110, 36);
     if (binding) {
         GradientButton(g, chip, L"Press a key...", id);
     } else {
@@ -2207,23 +2209,25 @@ void DrawHotkeysTab(Gdiplus::Graphics& g) {
     DrawCard(g, RectF(18, 128, 344, 70));
     Text(g, L"HOTKEYS", gFontLabel, ui::kText, RectF(34, 138, 300, 16));
     Text(g, L"Click a key, then press the new key.", gFontSmall, ui::kMuted, RectF(34, 157, 310, 15));
-    Text(g, L"Start/Exit work in any window. Esc cancels.", gFontSmall, ui::kMuted,
+    Text(g, L"Start, exit and bait keys work in any window. Esc cancels.", gFontSmall, ui::kMuted,
          RectF(34, 173, 310, 15));
 
     const bool binding = gBindingHotkey.load();
-    DrawKeyRow(g, 210, L"Start / Pause", L"global hotkey",
+    DrawKeyRow(g, 208, L"Start / Pause", L"global hotkey",
                KeyDisplayName(gToggleHotkeyVk.load()), kHitBindToggle, binding && gBindingTarget == 1);
-    DrawKeyRow(g, 276, L"Safe exit", L"closes the macro",
+    DrawKeyRow(g, 266, L"Safe exit", L"closes the macro",
                KeyDisplayName(gQuitHotkeyVk.load()), kHitBindQuit, binding && gBindingTarget == 2);
-    DrawKeyRow(g, 342, L"Correction key", L"pressed first when starting",
+    DrawKeyRow(g, 324, L"Auto bait buy", L"global: start / stop buying bait",
+               KeyDisplayName(gBaitHotkeyVk.load()), kHitBindBait, binding && gBindingTarget == 5);
+    DrawKeyRow(g, 382, L"Correction key", L"pressed first when starting",
                KeyDisplayName(gCorrectionKeyVk.load()), kHitBindCorrection, binding && gBindingTarget == 3);
-    DrawKeyRow(g, 408, L"Rod key", L"pressed next to equip the rod",
+    DrawKeyRow(g, 440, L"Rod key", L"pressed next to equip the rod",
                KeyDisplayName(gRodKeyVk.load()), kHitBindRod, binding && gBindingTarget == 4);
-    DrawKeyRow(g, 474, L"Collect key", L"held after each catch (fixed)", L"T", kHitNone, false);
+    DrawKeyRow(g, 498, L"Collect key", L"held after each catch (fixed)", L"T", kHitNone, false);
 
     if (binding) {
         TextCenter(g, L"Waiting for a key press \u00B7 Esc cancels", gFontSmall, ui::kWarn,
-                   RectF(18, 548, 344, 18));
+                   RectF(18, 560, 344, 18));
     }
 }
 
@@ -2356,10 +2360,12 @@ void DrawBaitTab(Gdiplus::Graphics& g) {
     if (running) {
         DrawCard(g, startR);
         HoverOverlay(g, startR, 14.0f, kHitBaitStart);
-        TextCenter(g, L"STOP BUYING", gFontButton, ui::kBad, startR);
+        const std::wstring stop = L"STOP BUYING   ( " + KeyDisplayName(gBaitHotkeyVk.load()) + L" )";
+        TextCenter(g, stop.c_str(), gFontButton, ui::kBad, startR);
         AddHit(startR, kHitBaitStart);
     } else if (AllBaitPointsSet()) {
-        swprintf_s(line, L"BUY %d BAIT", cycles * kBaitPerCycle);
+        swprintf_s(line, L"BUY %d BAIT   ( %s )", cycles * kBaitPerCycle,
+                   KeyDisplayName(gBaitHotkeyVk.load()).c_str());
         GradientButton(g, startR, line, kHitBaitStart, 14.0f);
     } else {
         FillInset(g, startR, 14.0f);
@@ -2639,6 +2645,8 @@ void LoadSettings() {
                                               static_cast<UINT>(VK_F8), path.c_str());
     if (toggleVk > 0 && toggleVk <= 0xFF) gToggleHotkeyVk.store(static_cast<WORD>(toggleVk));
     if (quitVk > 0 && quitVk <= 0xFF) gQuitHotkeyVk.store(static_cast<WORD>(quitVk));
+    const UINT baitVk = GetPrivateProfileIntW(L"Hotkeys", L"BaitVk", static_cast<UINT>(VK_F3), path.c_str());
+    if (baitVk > 0 && baitVk <= 0xFF) gBaitHotkeyVk.store(static_cast<WORD>(baitVk));
     const UINT waitSeconds = GetPrivateProfileIntW(L"Fishing", L"WaitForFishSeconds",
                                                     static_cast<UINT>(kDefaultWaitForFishMs / 1000),
                                                     path.c_str());
@@ -2712,6 +2720,8 @@ void SaveSettings() {
     WritePrivateProfileStringW(L"Hotkeys", L"ToggleVk", buf, path.c_str());
     swprintf_s(buf, L"%u", static_cast<unsigned>(gQuitHotkeyVk.load()));
     WritePrivateProfileStringW(L"Hotkeys", L"QuitVk", buf, path.c_str());
+    swprintf_s(buf, L"%u", static_cast<unsigned>(gBaitHotkeyVk.load()));
+    WritePrivateProfileStringW(L"Hotkeys", L"BaitVk", buf, path.c_str());
     swprintf_s(buf, L"%u", static_cast<unsigned>(gWaitForFishMs.load() / 1000));
     WritePrivateProfileStringW(L"Fishing", L"WaitForFishSeconds", buf, path.c_str());
     WriteIntSetting(L"Fishing", L"AutoRespawn", gAutoRespawn.load() ? 1 : 0, path);
@@ -2760,6 +2770,13 @@ void ApplyToggleHotkey(WORD vk) {
     RegisterHotKey(gWindow, HOTKEY_TOGGLE, MOD_NOREPEAT, vk);
     gToggleHotkeyVk.store(vk);
     UpdateButtonLabel();
+    SaveSettings();
+}
+
+void ApplyBaitHotkey(WORD vk) {
+    UnregisterHotKey(gWindow, HOTKEY_BAIT);
+    RegisterHotKey(gWindow, HOTKEY_BAIT, MOD_NOREPEAT, vk);
+    gBaitHotkeyVk.store(vk);
     SaveSettings();
 }
 
@@ -2928,6 +2945,10 @@ void HandleHit(HWND hwnd, int id) {
         case kHitBindCorrection:
             if (gBindingHotkey.load() && gBindingTarget == 3) EndHotkeyBind();
             else StartHotkeyBind(3);
+            break;
+        case kHitBindBait:
+            if (gBindingHotkey.load() && gBindingTarget == 5) EndHotkeyBind();
+            else StartHotkeyBind(5);
             break;
         case kHitBindRod:
             if (gBindingHotkey.load() && gBindingTarget == 4) EndHotkeyBind();
@@ -3113,6 +3134,11 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         case WM_HOTKEY:
             if (wParam == HOTKEY_TOGGLE) ToggleTracker();
             if (wParam == HOTKEY_QUIT) PostMessage(hwnd, WM_CLOSE, 0, 0);
+            if (wParam == HOTKEY_BAIT) {
+                if (gBaitRunning.load()) StopBaitBuying();
+                else StartBaitBuying();
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
             if (wParam == HOTKEY_CANCEL_CAPTURE) {
                 if (gCalibrating.load()) EndCalibration();
                 if (gBindingHotkey.load()) EndHotkeyBind();
@@ -3136,6 +3162,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             else if (target == 2) ApplyQuitHotkey(vk);
             else if (target == 3) { gCorrectionKeyVk.store(vk); SaveSettings(); }
             else if (target == 4) { gRodKeyVk.store(vk); SaveSettings(); }
+            else if (target == 5) ApplyBaitHotkey(vk);
             EndHotkeyBind();
             return 0;
         }
@@ -3231,6 +3258,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
 
     RegisterHotKey(gWindow, HOTKEY_TOGGLE, MOD_NOREPEAT, gToggleHotkeyVk.load());
     RegisterHotKey(gWindow, HOTKEY_QUIT, MOD_NOREPEAT, gQuitHotkeyVk.load());
+    RegisterHotKey(gWindow, HOTKEY_BAIT, MOD_NOREPEAT, gBaitHotkeyVk.load());
     ShowWindow(gWindow, showCommand);
     UpdateWindow(gWindow);
 
@@ -3250,6 +3278,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
         CloseHandle(thread);
     }
     UnregisterHotKey(gWindow, HOTKEY_TOGGLE);
+    UnregisterHotKey(gWindow, HOTKEY_BAIT);
     UnregisterHotKey(gWindow, HOTKEY_QUIT);
     DeleteObject(gUiFont);
     DeleteObject(gBackgroundBrush);

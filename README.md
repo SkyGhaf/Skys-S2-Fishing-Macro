@@ -30,7 +30,8 @@ on your own screen, so it runs at any resolution.
   Buy the selection → Dialogue → Deal → Dialogue 2 → Buy more). One round buys 99 bait, and it
   repeats until the chosen amount is bought (type an amount or pick 99 / 198 / 495 / 990 / 1980).
   Each click point is set with its own **Set** button, and the delay between clicks can be changed.
-  Fishing pauses while it is buying, and the Start/Pause hotkey stops a purchase.
+  It has its own global start/stop hotkey (default F3, changeable in the Hotkeys tab). Fishing
+  pauses while it is buying.
 - **Equip on start:** every time you press Start it quickly taps the *correction key* (default
   `1`) and then the *rod key* (default `5`). You can change both in the **Hotkeys** tab.
 - **Collect delay / Hold T time:** choose how long to wait after the minigame before holding **T**,
