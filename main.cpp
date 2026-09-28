@@ -23,6 +23,7 @@
 #include <vector>
 
 #include "fish_icons.h"
+#include "wen_icon.h"
 
 #pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "winmm.lib")
@@ -229,6 +230,7 @@ HHOOK gKeyboardHook = nullptr;
 ULONG_PTR gGdiplusToken = 0;
 Gdiplus::Bitmap* gFishOnIcon = nullptr;
 Gdiplus::Bitmap* gFishOffIcon = nullptr;
+Gdiplus::Bitmap* gWenIcon = nullptr; // Auto Bait wen calculator
 
 Gdiplus::Bitmap* LoadPngFromMemory(const unsigned char* data, size_t size) {
     HGLOBAL hMem = GlobalAlloc(GMEM_MOVEABLE, size);
@@ -2296,6 +2298,15 @@ constexpr float kBaitAmountRowY = 206.0f;
 constexpr float kBaitDelayRowY = 290.0f;
 const int kBaitPresets[5] = {99, 198, 495, 990, 1980};
 
+constexpr int kWenPerBait = 9;
+
+// 27621 -> "27,621"
+std::wstring WithThousands(long long value) {
+    std::wstring digits = std::to_wstring(value);
+    for (int i = static_cast<int>(digits.size()) - 3; i > 0; i -= 3) digits.insert(i, L",");
+    return digits;
+}
+
 void DrawBaitTab(Gdiplus::Graphics& g) {
     wchar_t line[128];
     const bool running = gBaitRunning.load();
@@ -2304,6 +2315,19 @@ void DrawBaitTab(Gdiplus::Graphics& g) {
     // --- Status -------------------------------------------------------------
     DrawCard(g, RectF(18, 128, 344, 62));
     Text(g, L"AUTO BAIT BUY", gFontLabel, ui::kText, RectF(34, 138, 300, 16));
+    {
+        // Wen calculator: every bait costs 9 wen.
+        const long long cost = static_cast<long long>(cycles) * kBaitPerCycle * kWenPerBait;
+        const std::wstring text = WithThousands(cost) + L" wen";
+        Gdiplus::RectF bounds;
+        g.MeasureString(text.c_str(), -1, gFontButton, Gdiplus::PointF(0, 0), &bounds);
+        const float textX = 348.0f - bounds.Width;
+        Text(g, text.c_str(), gFontButton, Gdiplus::Color(255, 214, 240, 70), RectF(textX, 134, bounds.Width + 2, 22));
+        if (gWenIcon) {
+            g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+            g.DrawImage(gWenIcon, RectF(textX - 36.0f, 133.0f, 33.0f, 24.0f)); // icon is 85x62
+        }
+    }
     if (running) {
         swprintf_s(line, L"Buying \u00B7 purchase %d/%d \u00B7 click %d/%d",
                    std::max(1, gBaitCycle.load()), cycles, std::max(1, gBaitClick.load()), kBaitClicks);
@@ -3209,6 +3233,7 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     Gdiplus::GdiplusStartup(&gGdiplusToken, &gdiplusStartupInput, nullptr);
     gFishOnIcon = LoadPngFromMemory(kFishOnPng, kFishOnPngSize);
     gFishOffIcon = LoadPngFromMemory(kFishOffPng, kFishOffPngSize);
+    gWenIcon = LoadPngFromMemory(kWenPng, kWenPngSize);
     CreateUiFonts();
 
     gBackgroundBrush = CreateSolidBrush(ui::kBgRef);
@@ -3289,6 +3314,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     delete gFishOnIcon;
     gFishOnIcon = nullptr;
     delete gFishOffIcon;
+    delete gWenIcon;
+    gWenIcon = nullptr;
     gFishOffIcon = nullptr;
     Gdiplus::GdiplusShutdown(gGdiplusToken);
     return 0;
