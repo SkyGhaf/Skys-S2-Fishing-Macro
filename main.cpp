@@ -316,6 +316,11 @@ std::atomic<bool> gBaitRunning{false};
 std::atomic<bool> gBaitStop{false};
 std::atomic<int> gBaitCycle{0};                // 1-based progress, for the UI
 std::atomic<int> gBaitClick{0};
+std::atomic<ULONGLONG> gBaitStartMs{0};        // when the current purchase run started
+// Time one click takes besides the click delay: focus check, the 12-step
+// mouse glide (~135 ms), 80 ms settle and the 50 ms press. Only used for the
+// estimate before starting; while buying the real measured pace is used.
+constexpr int kBaitClickOverheadMs = 290;
 std::atomic<bool> gBaitFocusLost{false};       // last run stopped: game not in front
 HWND gBaitAmountEdit = nullptr;
 HWND gBaitDelayEdit = nullptr;
@@ -1788,6 +1793,7 @@ void StartBaitBuying() {
     gBaitStop.store(false);
     gBaitCycle.store(0);
     gBaitClick.store(0);
+    gBaitStartMs.store(GetTickCount64());
     gBaitRunning.store(true);
     HANDLE thread = CreateThread(nullptr, 0, BaitThread, nullptr, 0, nullptr);
     if (thread) CloseHandle(thread);
@@ -2307,6 +2313,27 @@ std::wstring WithThousands(long long value) {
     return digits;
 }
 
+// 185000 -> "3:05", 4000000 -> "1:06:40"
+std::wstring FormatDuration(ULONGLONG ms) {
+    const ULONGLONG total = (ms + 999) / 1000;
+    wchar_t buf[32];
+    if (total >= 3600) swprintf_s(buf, L"%llu:%02llu:%02llu", total / 3600, (total / 60) % 60, total % 60);
+    else swprintf_s(buf, L"%llu:%02llu", total / 60, total % 60);
+    return buf;
+}
+
+// Time left for the bait purchase: before/at the start from the settings,
+// after a few clicks from the actually measured pace.
+ULONGLONG BaitTimeLeftMs(int cycles) {
+    const int totalClicks = cycles * kBaitClicks;
+    const ULONGLONG estimatePerClick = static_cast<ULONGLONG>(gBaitDelayMs.load() + kBaitClickOverheadMs);
+    if (!gBaitRunning.load()) return totalClicks * estimatePerClick;
+    const int done = std::max(0, (gBaitCycle.load() - 1) * kBaitClicks + gBaitClick.load() - 1);
+    const ULONGLONG elapsed = GetTickCount64() - gBaitStartMs.load();
+    const ULONGLONG perClick = done >= 3 ? elapsed / done : estimatePerClick;
+    return static_cast<ULONGLONG>(std::max(0, totalClicks - done)) * perClick;
+}
+
 void DrawBaitTab(Gdiplus::Graphics& g) {
     wchar_t line[128];
     const bool running = gBaitRunning.load();
@@ -2329,8 +2356,9 @@ void DrawBaitTab(Gdiplus::Graphics& g) {
         }
     }
     if (running) {
-        swprintf_s(line, L"Buying \u00B7 purchase %d/%d \u00B7 click %d/%d",
-                   std::max(1, gBaitCycle.load()), cycles, std::max(1, gBaitClick.load()), kBaitClicks);
+        swprintf_s(line, L"Buying %d/%d \u00B7 click %d/%d \u00B7 %ls left",
+                   std::max(1, gBaitCycle.load()), cycles, std::max(1, gBaitClick.load()), kBaitClicks,
+                   FormatDuration(BaitTimeLeftMs(cycles)).c_str());
         Text(g, line, gFontBody, ui::kGradA, RectF(34, 158, 312, 18));
     } else if (gCalibrating.load() && gCalibrationTarget == CalibrationTarget::BaitPoint) {
         swprintf_s(line, L"CLICK \"%s\" in the shop (Esc cancels)", kBaitClickNames[gBaitCalibIndex]);
@@ -2340,8 +2368,8 @@ void DrawBaitTab(Gdiplus::Graphics& g) {
     } else if (gBaitFocusLost.load()) {
         Text(g, L"Stopped: Roblox was not in front", gFontBody, ui::kBad, RectF(34, 158, 312, 18));
     } else {
-        swprintf_s(line, L"Ready \u00B7 %d purchase%s of 99 = %d bait", cycles, cycles == 1 ? L"" : L"s",
-                   cycles * kBaitPerCycle);
+        swprintf_s(line, L"Ready \u00B7 %d\u00D799 = %d bait \u00B7 takes \u2248 %ls", cycles,
+                   cycles * kBaitPerCycle, FormatDuration(BaitTimeLeftMs(cycles)).c_str());
         Text(g, line, gFontBody, ui::kSoft, RectF(34, 158, 312, 18));
     }
 
