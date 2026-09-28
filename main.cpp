@@ -49,6 +49,8 @@ constexpr int ID_RESPAWN_CHECK = 1010;
 constexpr int ID_RESPAWN_EDIT = 1011;
 constexpr int ID_COLLECT_EDIT = 1012;
 constexpr int ID_HOLD_EDIT = 1013;
+constexpr int ID_BAIT_AMOUNT_EDIT = 1014;
+constexpr int ID_BAIT_DELAY_EDIT = 1015;
 constexpr int HOTKEY_TOGGLE = 1;
 constexpr int HOTKEY_QUIT = 2;
 // Shared by both "Calibrate Start Point" and the hotkey binder: whichever
@@ -191,7 +193,7 @@ HBRUSH gBackgroundBrush = nullptr;
 int gActiveTab = 0; // 0 = Fishing, 1 = Settings, 2 = Hotkeys, 3 = Setup
 
 // Which calibration is currently in progress, if any.
-enum class CalibrationTarget { None, CastPoint, BarRegion, ExitRegion, CollectRegion };
+enum class CalibrationTarget { None, CastPoint, BarRegion, ExitRegion, CollectRegion, BaitPoint };
 CalibrationTarget gCalibrationTarget = CalibrationTarget::None; // UI thread only
 POINT gDragStart{};   // first corner of a region drag, set by the mouse hook
 bool gDragging = false; // UI thread only; true between mousedown and mouseup
@@ -295,6 +297,39 @@ void SetExitRect(RECT r) {
 // Where the game shows the "<item> x1" message after collecting.
 std::mutex gCollectRectMutex;
 RECT gCollectRect{0, 0, 0, 0};
+
+// Auto bait buy: the 7 buttons clicked in order for one purchase of 99 bait.
+constexpr int kBaitClicks = 7;
+constexpr int kBaitPerCycle = 99;
+const wchar_t* const kBaitClickNames[kBaitClicks] = {
+    L"Fish head bait", L"Max", L"Buy the selection", L"Dialogue", L"Deal", L"Dialogue 2", L"Buy more"};
+std::mutex gBaitPointsMutex;
+POINT gBaitPoints[kBaitClicks] = {};
+int gBaitCalibIndex = 0;                       // which point is being calibrated (UI thread)
+std::atomic<int> gBaitAmount{kBaitPerCycle};   // always a multiple of 99
+std::atomic<int> gBaitDelayMs{600};            // pause after each click
+std::atomic<bool> gBaitRunning{false};
+std::atomic<bool> gBaitStop{false};
+std::atomic<int> gBaitCycle{0};                // 1-based progress, for the UI
+std::atomic<int> gBaitClick{0};
+std::atomic<bool> gBaitFocusLost{false};       // last run stopped: game not in front
+HWND gBaitAmountEdit = nullptr;
+HWND gBaitDelayEdit = nullptr;
+
+POINT GetBaitPoint(int i) {
+    std::lock_guard<std::mutex> lock(gBaitPointsMutex);
+    return gBaitPoints[i];
+}
+
+void SetBaitPoint(int i, POINT p) {
+    std::lock_guard<std::mutex> lock(gBaitPointsMutex);
+    gBaitPoints[i] = p;
+}
+
+bool BaitPointSet(int i) {
+    const POINT p = GetBaitPoint(i);
+    return p.x != 0 || p.y != 0;
+}
 
 RECT GetCollectRect() {
     std::lock_guard<std::mutex> lock(gCollectRectMutex);
@@ -1695,6 +1730,71 @@ DWORD WINAPI TrackerThread(void*) {
 }
 
 // ---------------------------------------------------------------------------
+// Auto bait buy: clicks the 7 calibrated shop buttons in order, once per 99
+// bait, on its own thread. Every click first makes sure Roblox is in front
+// (same rule as fishing), and moves the mouse there for real so the game
+// registers it. Fishing is paused while buying.
+// ---------------------------------------------------------------------------
+bool BaitWait(int ms) {
+    for (int waited = 0; waited < ms; waited += 20) {
+        if (gBaitStop.load() || gQuit.load()) return false;
+        Sleep(20);
+    }
+    return !gBaitStop.load() && !gQuit.load();
+}
+
+DWORD WINAPI BaitThread(void*) {
+    const int cycles = std::max(1, gBaitAmount.load() / kBaitPerCycle);
+    gBaitFocusLost.store(false);
+    for (int cycle = 1; cycle <= cycles && !gBaitStop.load(); ++cycle) {
+        gBaitCycle.store(cycle);
+        for (int i = 0; i < kBaitClicks && !gBaitStop.load(); ++i) {
+            gBaitClick.store(i + 1);
+            PostMessage(gWindow, WM_TRACKER_UPDATE, 0, 0);
+            if (!FocusGame()) {
+                gBaitFocusLost.store(true);
+                gBaitStop.store(true);
+                break;
+            }
+            GlideMouseTo(GetBaitPoint(i));
+            if (!BaitWait(80)) break;
+            MouseButton(true);
+            Sleep(50);
+            MouseButton(false);
+            if (!BaitWait(gBaitDelayMs.load())) break;
+        }
+    }
+    MouseButton(false);
+    gBaitRunning.store(false);
+    PostMessage(gWindow, WM_TRACKER_UPDATE, 0, 0);
+    return 0;
+}
+
+bool AllBaitPointsSet() {
+    for (int i = 0; i < kBaitClicks; ++i) {
+        if (!BaitPointSet(i)) return false;
+    }
+    return true;
+}
+
+void StartBaitBuying() {
+    if (gBaitRunning.load() || !AllBaitPointsSet()) return;
+    gEnabled.store(false); // no fishing clicks in between the shop clicks
+    MouseButton(false);
+    gBaitStop.store(false);
+    gBaitCycle.store(0);
+    gBaitClick.store(0);
+    gBaitRunning.store(true);
+    HANDLE thread = CreateThread(nullptr, 0, BaitThread, nullptr, 0, nullptr);
+    if (thread) CloseHandle(thread);
+    else gBaitRunning.store(false);
+}
+
+void StopBaitBuying() {
+    gBaitStop.store(true);
+}
+
+// ---------------------------------------------------------------------------
 // Sky's S2 Fishing Macro - custom-drawn UI.
 // Everything below the title bar is painted with GDI+ (dark navy cards with a
 // soft shadow, teal->blue gradient for anything active) and hit-tested by
@@ -1731,10 +1831,12 @@ HBRUSH gInputBrush = nullptr;
 
 enum HitId {
     kHitNone = 0,
-    kHitTab0 = 1, kHitTab1, kHitTab2, kHitTab3,
+    kHitTab0 = 1, kHitTab1, kHitTab2, kHitTab3, kHitTab4,
     kHitStart = 10, kHitExit, kHitClose, kHitRespawnToggle, kHitMinimize,
     kHitBindToggle = 20, kHitBindQuit, kHitBindCorrection, kHitBindRod,
     kHitCalCast = 30, kHitCalBar, kHitCalExit, kHitLogToggle, kHitCalCollect,
+    kHitBaitStart = 40, kHitBaitPreset0, // presets: kHitBaitPreset0 + 0..4
+    kHitBaitCal0 = 50,                   // calibration: kHitBaitCal0 + 0..6
 };
 struct HitRegion {
     RECT rect;
@@ -2048,7 +2150,7 @@ void DrawFishingTab(Gdiplus::Graphics& g, const Telemetry& t) {
                    RectF(18, 578, 344, 18));
     } else {
         const POINT cast = GetCastPoint();
-        swprintf_s(line, L"Cast point (%ld, %ld)  ·  v2.5", cast.x, cast.y);
+        swprintf_s(line, L"Cast point (%ld, %ld)  ·  v2.6", cast.x, cast.y);
         TextCenter(g, line, gFontSmall, ui::kMuted, RectF(18, 578, 344, 18));
     }
 }
@@ -2184,6 +2286,86 @@ void DrawSetupTab(Gdiplus::Graphics& g) {
                        calibrating && gCalibrationTarget == CalibrationTarget::CollectRegion);
 }
 
+// Auto bait buy page. The two EDIT controls sit on the inset boxes of the
+// amount card (created in WM_CREATE at kBaitRowY + 9).
+constexpr float kBaitAmountRowY = 206.0f;
+constexpr float kBaitDelayRowY = 250.0f;
+const int kBaitPresets[5] = {99, 198, 495, 990, 1980};
+
+void DrawBaitTab(Gdiplus::Graphics& g) {
+    wchar_t line[128];
+    const bool running = gBaitRunning.load();
+    const int cycles = std::max(1, gBaitAmount.load() / kBaitPerCycle);
+
+    // --- Status -------------------------------------------------------------
+    DrawCard(g, RectF(18, 128, 344, 62));
+    Text(g, L"AUTO BAIT BUY", gFontLabel, ui::kText, RectF(34, 138, 300, 16));
+    if (running) {
+        swprintf_s(line, L"Buying \u00B7 purchase %d/%d \u00B7 click %d/%d",
+                   std::max(1, gBaitCycle.load()), cycles, std::max(1, gBaitClick.load()), kBaitClicks);
+        Text(g, line, gFontBody, ui::kGradA, RectF(34, 158, 312, 18));
+    } else if (gCalibrating.load() && gCalibrationTarget == CalibrationTarget::BaitPoint) {
+        swprintf_s(line, L"CLICK \"%s\" in the shop (Esc cancels)", kBaitClickNames[gBaitCalibIndex]);
+        Text(g, line, gFontBody, ui::kWarn, RectF(34, 158, 312, 18));
+    } else if (!AllBaitPointsSet()) {
+        Text(g, L"Set all 7 click points below first", gFontBody, ui::kWarn, RectF(34, 158, 312, 18));
+    } else if (gBaitFocusLost.load()) {
+        Text(g, L"Stopped: Roblox was not in front", gFontBody, ui::kBad, RectF(34, 158, 312, 18));
+    } else {
+        swprintf_s(line, L"Ready \u00B7 %d purchase%s of 99 = %d bait", cycles, cycles == 1 ? L"" : L"s",
+                   cycles * kBaitPerCycle);
+        Text(g, line, gFontBody, ui::kSoft, RectF(34, 158, 312, 18));
+    }
+
+    // --- Amount / delay / presets -----------------------------------------------
+    DrawCard(g, RectF(18, 200, 344, 126));
+    RowLabel(g, kBaitAmountRowY, L"Bait to buy", L"rounded up to 99 per purchase");
+    FillInset(g, RectF(266, kBaitAmountRowY + 5, 80, 30), 9.0f);
+    Divider(g, kBaitDelayRowY - 3);
+    RowLabel(g, kBaitDelayRowY, L"Click delay", L"ms to wait after each click");
+    FillInset(g, RectF(266, kBaitDelayRowY + 5, 80, 30), 9.0f);
+    for (int i = 0; i < 5; ++i) {
+        const RectF chip(34.0f + i * 63.0f, 292.0f, 58.0f, 26.0f);
+        swprintf_s(line, L"%d", kBaitPresets[i]);
+        if (gBaitAmount.load() == kBaitPresets[i]) GradientButton(g, chip, line, kHitBaitPreset0 + i, 13.0f);
+        else InsetButton(g, chip, line, kHitBaitPreset0 + i, ui::kSoft, 13.0f);
+    }
+
+    // --- Click points -------------------------------------------------------------
+    DrawCard(g, RectF(18, 338, 344, 7 * 28 + 12));
+    for (int i = 0; i < kBaitClicks; ++i) {
+        const float y = 344.0f + i * 28.0f;
+        const bool active = running && gBaitClick.load() == i + 1;
+        swprintf_s(line, L"%d", i + 1);
+        Text(g, line, gFontLabel, active ? ui::kGradA : ui::kMuted, RectF(32, y, 14, 26));
+        Text(g, kBaitClickNames[i], gFontBody, active ? ui::kGradA : ui::kText, RectF(48, y, 140, 26));
+        const POINT bp = GetBaitPoint(i);
+        if (BaitPointSet(i)) swprintf_s(line, L"(%ld, %ld)", bp.x, bp.y);
+        else swprintf_s(line, L"not set");
+        Text(g, line, gFontSmall, BaitPointSet(i) ? ui::kMuted : ui::kBad, RectF(188, y, 100, 26));
+        const RectF button(292, y + 2, 56, 22);
+        const bool calibratingThis = gCalibrating.load() &&
+            gCalibrationTarget == CalibrationTarget::BaitPoint && gBaitCalibIndex == i;
+        if (calibratingThis) InsetButton(g, button, L"...", kHitBaitCal0 + i, ui::kWarn, 11.0f);
+        else InsetButton(g, button, L"Set", kHitBaitCal0 + i, ui::kSoft, 11.0f);
+    }
+
+    // --- Start / stop -----------------------------------------------------------------
+    const RectF startR(18, 552, 344, 46);
+    if (running) {
+        DrawCard(g, startR);
+        HoverOverlay(g, startR, 14.0f, kHitBaitStart);
+        TextCenter(g, L"STOP BUYING", gFontButton, ui::kBad, startR);
+        AddHit(startR, kHitBaitStart);
+    } else if (AllBaitPointsSet()) {
+        swprintf_s(line, L"BUY %d BAIT", cycles * kBaitPerCycle);
+        GradientButton(g, startR, line, kHitBaitStart, 14.0f);
+    } else {
+        FillInset(g, startR, 14.0f);
+        TextCenter(g, L"SET ALL 7 CLICK POINTS FIRST", gFontButton, ui::kMuted, startR);
+    }
+}
+
 void PaintHud(HWND hwnd) {
     PAINTSTRUCT ps{};
     HDC windowDc = BeginPaint(hwnd, &ps);
@@ -2231,9 +2413,9 @@ void PaintHud(HWND hwnd) {
 
         // Segmented tab bar.
         DrawCard(g, RectF(18, 72, 344, 42));
-        const wchar_t* tabs[4] = {L"Fishing", L"Settings", L"Hotkeys", L"Setup"};
-        for (int i = 0; i < 4; ++i) {
-            const RectF seg(22.0f + i * 84.0f, 76.0f, 84.0f, 34.0f);
+        const wchar_t* tabs[5] = {L"Fishing", L"Settings", L"Hotkeys", L"Setup", L"Auto Bait"};
+        for (int i = 0; i < 5; ++i) {
+            const RectF seg(22.0f + i * 67.2f, 76.0f, 67.2f, 34.0f);
             const int id = kHitTab0 + i;
             if (gActiveTab == i) FillGradient(g, seg, 11.0f);
             else HoverOverlay(g, seg, 11.0f, id);
@@ -2244,7 +2426,8 @@ void PaintHud(HWND hwnd) {
         if (gActiveTab == 0) DrawFishingTab(g, t);
         else if (gActiveTab == 1) DrawSettingsTab(g);
         else if (gActiveTab == 2) DrawHotkeysTab(g);
-        else DrawSetupTab(g);
+        else if (gActiveTab == 3) DrawSetupTab(g);
+        else DrawBaitTab(g);
     }
 
     BitBlt(windowDc, 0, 0, client.right, client.bottom, dc, 0, 0, SRCCOPY);
@@ -2289,6 +2472,10 @@ void UpdateExitButtonLabel() {
 }
 
 void ToggleTracker() {
+    if (gBaitRunning.load()) {
+        StopBaitBuying();
+        return;
+    }
     gEnabled.store(!gEnabled.load());
     if (!gEnabled.load()) MouseButton(false);
     UpdateButtonLabel();
@@ -2313,6 +2500,13 @@ LRESULT CALLBACK CalibrationMouseProc(int code, WPARAM wParam, LPARAM lParam) {
         return CallNextHookEx(nullptr, code, wParam, lParam);
     }
     const POINT pt{info->pt.x, info->pt.y};
+
+    if (gCalibrationTarget == CalibrationTarget::BaitPoint) {
+        if (wParam != WM_LBUTTONDOWN) return CallNextHookEx(nullptr, code, wParam, lParam);
+        SetBaitPoint(gBaitCalibIndex, pt);
+        PostMessage(gWindow, WM_CALIBRATION_DONE, 0, 0);
+        return 1; // swallow: calibrating must not already press the shop button
+    }
 
     if (gCalibrationTarget == CalibrationTarget::CastPoint) {
         if (wParam != WM_LBUTTONDOWN) return CallNextHookEx(nullptr, code, wParam, lParam);
@@ -2464,6 +2658,17 @@ void LoadSettings() {
         static_cast<ULONGLONG>(GetPrivateProfileIntW(L"Fishing", L"HoldKeySeconds",
             static_cast<UINT>(kDefaultHoldKeyMs / 1000), path.c_str())) * 1000ULL,
         kMinHoldKeyMs, kMaxHoldKeyMs));
+    {
+        const int amount = ReadIntSetting(L"Bait", L"Amount", kBaitPerCycle, path);
+        gBaitAmount.store(std::clamp((amount + kBaitPerCycle - 1) / kBaitPerCycle, 1, 999) * kBaitPerCycle);
+        gBaitDelayMs.store(std::clamp(ReadIntSetting(L"Bait", L"DelayMs", 600, path), 100, 5000));
+        for (int i = 0; i < kBaitClicks; ++i) {
+            wchar_t kx[16], ky[16];
+            swprintf_s(kx, L"P%dX", i + 1);
+            swprintf_s(ky, L"P%dY", i + 1);
+            SetBaitPoint(i, POINT{ReadIntSetting(L"Bait", kx, 0, path), ReadIntSetting(L"Bait", ky, 0, path)});
+        }
+    }
     const UINT correctionVk = GetPrivateProfileIntW(L"Keys", L"CorrectionVk", '1', path.c_str());
     const UINT rodVk = GetPrivateProfileIntW(L"Keys", L"RodVk", '5', path.c_str());
     if (correctionVk > 0 && correctionVk <= 0xFF) gCorrectionKeyVk.store(static_cast<WORD>(correctionVk));
@@ -2512,6 +2717,16 @@ void SaveSettings() {
     WriteIntSetting(L"Fishing", L"RespawnEveryCatches", gRespawnEveryCatches.load(), path);
     WriteIntSetting(L"Fishing", L"CollectDelaySeconds", static_cast<int>(gCollectDelayMs.load() / 1000), path);
     WriteIntSetting(L"Fishing", L"HoldKeySeconds", static_cast<int>(gHoldKeyMs.load() / 1000), path);
+    WriteIntSetting(L"Bait", L"Amount", gBaitAmount.load(), path);
+    WriteIntSetting(L"Bait", L"DelayMs", gBaitDelayMs.load(), path);
+    for (int i = 0; i < kBaitClicks; ++i) {
+        wchar_t kx[16], ky[16];
+        swprintf_s(kx, L"P%dX", i + 1);
+        swprintf_s(ky, L"P%dY", i + 1);
+        const POINT bp = GetBaitPoint(i);
+        WriteIntSetting(L"Bait", kx, bp.x, path);
+        WriteIntSetting(L"Bait", ky, bp.y, path);
+    }
     WriteIntSetting(L"Debug", L"MinigameLog", gMinigameLog.load() ? 1 : 0, path);
     WriteIntSetting(L"Keys", L"CorrectionVk", gCorrectionKeyVk.load(), path);
     WriteIntSetting(L"Keys", L"RodVk", gRodKeyVk.load(), path);
@@ -2599,6 +2814,9 @@ void EndHotkeyBind() {
 void SetActiveTab(int tab) {
     gActiveTab = tab;
     const int show = (tab == 1) ? SW_SHOW : SW_HIDE;
+    const int showBait = (tab == 4) ? SW_SHOW : SW_HIDE;
+    if (gBaitAmountEdit) ShowWindow(gBaitAmountEdit, showBait);
+    if (gBaitDelayEdit) ShowWindow(gBaitDelayEdit, showBait);
     if (gHoldKeyEdit) ShowWindow(gHoldKeyEdit, show);
     if (gWaitFishEdit) ShowWindow(gWaitFishEdit, show);
     if (gRespawnEdit) ShowWindow(gRespawnEdit, show);
@@ -2653,6 +2871,34 @@ void UpdateHoldKeySetting() {
     SaveSettings();
 }
 
+// Typed bait amount is rounded up to whole purchases of 99.
+void SetBaitAmount(int amount) {
+    gBaitAmount.store(std::clamp((amount + kBaitPerCycle - 1) / kBaitPerCycle, 1, 999) * kBaitPerCycle);
+    wchar_t buf[32];
+    swprintf_s(buf, L"%d", gBaitAmount.load());
+    if (gBaitAmountEdit) SetWindowTextW(gBaitAmountEdit, buf);
+    SaveSettings();
+}
+
+void UpdateBaitAmountSetting() {
+    wchar_t buf[32]{};
+    GetWindowTextW(gBaitAmountEdit, buf, 32);
+    wchar_t* end = nullptr;
+    const unsigned long value = wcstoul(buf, &end, 10);
+    SetBaitAmount(end != buf ? static_cast<int>(std::min<unsigned long>(value, 99000)) : gBaitAmount.load());
+}
+
+void UpdateBaitDelaySetting() {
+    wchar_t buf[32]{};
+    GetWindowTextW(gBaitDelayEdit, buf, 32);
+    wchar_t* end = nullptr;
+    const unsigned long value = wcstoul(buf, &end, 10);
+    if (end != buf) gBaitDelayMs.store(std::clamp(static_cast<int>(std::min<unsigned long>(value, 99999)), 100, 5000));
+    swprintf_s(buf, L"%d", gBaitDelayMs.load());
+    SetWindowTextW(gBaitDelayEdit, buf);
+    SaveSettings();
+}
+
 void UpdateRespawnEverySetting() {
     wchar_t buf[32]{};
     GetWindowTextW(gRespawnEdit, buf, 32);
@@ -2669,7 +2915,7 @@ void UpdateRespawnEverySetting() {
 
 void HandleHit(HWND hwnd, int id) {
     switch (id) {
-        case kHitTab0: case kHitTab1: case kHitTab2: case kHitTab3:
+        case kHitTab0: case kHitTab1: case kHitTab2: case kHitTab3: case kHitTab4:
             SetActiveTab(id - kHitTab0);
             break;
         case kHitStart:
@@ -2714,6 +2960,24 @@ void HandleHit(HWND hwnd, int id) {
             if (gCalibrating.load() && gCalibrationTarget == CalibrationTarget::BarRegion) EndCalibration();
             else StartCalibration(CalibrationTarget::BarRegion);
             break;
+        case kHitBaitStart:
+            if (gBaitRunning.load()) StopBaitBuying();
+            else StartBaitBuying();
+            break;
+        case kHitBaitPreset0: case kHitBaitPreset0 + 1: case kHitBaitPreset0 + 2:
+        case kHitBaitPreset0 + 3: case kHitBaitPreset0 + 4:
+            SetBaitAmount(kBaitPresets[id - kHitBaitPreset0]);
+            break;
+        case kHitBaitCal0: case kHitBaitCal0 + 1: case kHitBaitCal0 + 2: case kHitBaitCal0 + 3:
+        case kHitBaitCal0 + 4: case kHitBaitCal0 + 5: case kHitBaitCal0 + 6:
+            if (gCalibrating.load() && gCalibrationTarget == CalibrationTarget::BaitPoint &&
+                gBaitCalibIndex == id - kHitBaitCal0) {
+                EndCalibration();
+            } else if (!gCalibrating.load() && !gBaitRunning.load()) {
+                gBaitCalibIndex = id - kHitBaitCal0;
+                StartCalibration(CalibrationTarget::BaitPoint);
+            }
+            break;
         case kHitCalCollect:
             if (gCalibrating.load() && gCalibrationTarget == CalibrationTarget::CollectRegion) EndCalibration();
             else StartCalibration(CalibrationTarget::CollectRegion);
@@ -2746,7 +3010,15 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             gCollectEdit = CreateNumberEdit(hwnd, ID_COLLECT_EDIT, 272, editY(1));
             gHoldKeyEdit = CreateNumberEdit(hwnd, ID_HOLD_EDIT, 272, editY(2));
             gRespawnEdit = CreateNumberEdit(hwnd, ID_RESPAWN_EDIT, 272, editY(4));
+            gBaitAmountEdit = CreateNumberEdit(hwnd, ID_BAIT_AMOUNT_EDIT, 272, static_cast<int>(kBaitAmountRowY) + 9);
+            gBaitDelayEdit = CreateNumberEdit(hwnd, ID_BAIT_DELAY_EDIT, 272, static_cast<int>(kBaitDelayRowY) + 9);
+            SendMessage(gBaitAmountEdit, EM_SETLIMITTEXT, 5, 0);
+            SendMessage(gBaitDelayEdit, EM_SETLIMITTEXT, 4, 0);
             wchar_t buf[32];
+            swprintf_s(buf, L"%d", gBaitAmount.load());
+            SetWindowTextW(gBaitAmountEdit, buf);
+            swprintf_s(buf, L"%d", gBaitDelayMs.load());
+            SetWindowTextW(gBaitDelayEdit, buf);
             swprintf_s(buf, L"%u", static_cast<unsigned>(gHoldKeyMs.load() / 1000));
             SetWindowTextW(gHoldKeyEdit, buf);
             swprintf_s(buf, L"%u", static_cast<unsigned>(gCollectDelayMs.load() / 1000));
@@ -2766,6 +3038,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         case WM_COMMAND:
             if (LOWORD(wParam) == ID_WAIT_FISH_EDIT && HIWORD(wParam) == EN_KILLFOCUS) {
                 UpdateWaitForFishSetting();
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            if (LOWORD(wParam) == ID_BAIT_AMOUNT_EDIT && HIWORD(wParam) == EN_KILLFOCUS) {
+                UpdateBaitAmountSetting();
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            if (LOWORD(wParam) == ID_BAIT_DELAY_EDIT && HIWORD(wParam) == EN_KILLFOCUS) {
+                UpdateBaitDelaySetting();
                 InvalidateRect(hwnd, nullptr, FALSE);
             }
             if (LOWORD(wParam) == ID_HOLD_EDIT && HIWORD(wParam) == EN_KILLFOCUS) {
@@ -2875,6 +3155,7 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             return result;
         }
         case WM_CLOSE:
+            StopBaitBuying();
             gEnabled.store(false);
             gQuit.store(true);
             MouseButton(false);

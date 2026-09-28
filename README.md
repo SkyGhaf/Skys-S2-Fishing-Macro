@@ -26,6 +26,11 @@ on your own screen, so it runs at any resolution.
 - **ORE counter:** Ore is a Mythic with a very short name. A Mythic whose name is at most ~46 px
   wide at 1440p (scaled for other resolutions) counts as **ORE**. "Ore" is 36 px; the shortest
   other item is 56 px.
+- **Auto bait buy (Auto Bait tab):** clicks the 7 shop buttons in order (Fish head bait → Max →
+  Buy the selection → Dialogue → Deal → Dialogue 2 → Buy more). One round buys 99 bait, and it
+  repeats until the chosen amount is bought (type an amount or pick 99 / 198 / 495 / 990 / 1980).
+  Each click point is set with its own **Set** button, and the delay between clicks can be changed.
+  Fishing pauses while it is buying, and the Start/Pause hotkey stops a purchase.
 - **Equip on start:** every time you press Start it quickly taps the *correction key* (default
   `1`) and then the *rod key* (default `5`). You can change both in the **Hotkeys** tab.
 - **Collect delay / Hold T time:** choose how long to wait after the minigame before holding **T**,
