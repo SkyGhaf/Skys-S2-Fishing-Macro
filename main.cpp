@@ -850,71 +850,101 @@ int CollectMessageScore(const CaptureSurface& surface, const std::vector<uint32_
     return score;
 }
 
-// Rarity of a collected item, read from the colour of the message's banner
-// border (a long horizontal line behind the name): red = Mythic (Lost Mask),
-// gold = Legendary (Crustadon), blue = Rare (Clown Fish). Common items have a
-// grey banner, i.e. no coloured line at all.
+// Rarity of a collected item, read from the thin coloured line along the top
+// of the message's banner: red = Mythic, gold = Legendary, blue = Rare,
+// grey = Common. The banner is translucent, so that line's on-screen colour
+// depends on what is behind it (brown deck vs grey-blue water/sky); it is
+// matched against samples measured from 64 real collects, per background.
 enum Rarity { kRarityMythic = 0, kRarityLegendary, kRarityRare, kRarityCommon, kRarityCount };
 const wchar_t* const kRarityNames[kRarityCount] = {L"Mythic", L"Legendary", L"Rare", L"Common"};
 
-// Rarity colour of a saturated pixel, or -1 for grey/dark/white (and for
-// green/purple, which no rarity uses).
-int RarityBucket(uint32_t p) {
+struct RarityPrototype {
+    int rarity;
+    bool water; // background type the sample was taken over
     int r, g, b;
-    ReadRgb(p, r, g, b);
-    const int mx = std::max({r, g, b});
-    const int mn = std::min({r, g, b});
-    const int d = mx - mn;
-    if (mx < 56 || d * 100 < mx * 35) return -1; // too dark or not saturated
-    double h;
-    if (mx == r) h = 60.0 * std::fmod(static_cast<double>(g - b) / d, 6.0);
-    else if (mx == g) h = 60.0 * (static_cast<double>(b - r) / d + 2.0);
-    else h = 60.0 * (static_cast<double>(r - g) / d + 4.0);
-    if (h < 0.0) h += 360.0;
-    if (h < 15.0 || h >= 335.0) return kRarityMythic;
-    if (h < 75.0) return kRarityLegendary;
-    if (h >= 165.0 && h < 255.0) return kRarityRare;
-    return -1;
+};
+const RarityPrototype kRarityPrototypes[] = {
+    {kRarityCommon, false, 114, 92, 66},    {kRarityLegendary, false, 120, 86, 32},
+    {kRarityMythic, false, 98, 38, 23},     {kRarityRare, false, 77, 81, 75},
+    {kRarityCommon, true, 110, 112, 114},   {kRarityLegendary, true, 126, 113, 83},
+    {kRarityMythic, true, 108, 69, 76},     {kRarityRare, true, 85, 111, 135},
+};
+
+// Median colour of one row, skipping the left quarter (item icon) and the
+// white text. False if too few pixels remain.
+bool RowMedian(const uint32_t* px, int w, int y, int out[3]) {
+    std::vector<int> ch[3];
+    for (int x = w / 4; x < w; ++x) {
+        const uint32_t p = px[y * w + x];
+        if (Luma(p) >= 170) continue;
+        int r, g, b;
+        ReadRgb(p, r, g, b);
+        ch[0].push_back(r);
+        ch[1].push_back(g);
+        ch[2].push_back(b);
+    }
+    if (static_cast<int>(ch[0].size()) < w / 4) return false;
+    for (int c = 0; c < 3; ++c) {
+        auto mid = ch[c].begin() + ch[c].size() / 2;
+        std::nth_element(ch[c].begin(), mid, ch[c].end());
+        out[c] = *mid;
+    }
+    return true;
 }
 
-// Longest horizontal run of one colour among pixels that are new since the
-// baseline (so blue water behind the message doesn't count). The banner
-// border spans most of the message; the item icon only gives short runs.
-// Returns the bucket and writes the run length.
-int ClassifyRarity(const CaptureSurface& surface, const std::vector<uint32_t>& baseline, int& runOut) {
-    runOut = 0;
-    const int w = surface.width;
-    if (static_cast<int>(baseline.size()) != w * surface.height) return kRarityCommon;
-    int best = kRarityCommon;
-    for (int y = 0; y < surface.height; ++y) {
-        int run = 0;
-        int prev = -1;
-        for (int x = 0; x < w; ++x) {
-            const uint32_t now = surface.pixels[y * w + x];
-            const uint32_t base = baseline[y * w + x];
-            int r1, g1, b1, r0, g0, b0;
-            ReadRgb(now, r1, g1, b1);
-            ReadRgb(base, r0, g0, b0);
-            const bool changed = std::max({std::abs(r1 - r0), std::abs(g1 - g0), std::abs(b1 - b0)}) >= 40;
-            int bucket = changed ? RarityBucket(now) : -1;
-            // The banner is a translucent dark panel: over water its whole
-            // interior turns into a long darker-blue strip that beat the real
-            // (coloured) border and made Legendary/Common read as Rare. A
-            // pixel with the same colour family as what was behind it that
-            // only got darker is background seen through the panel - skip it.
-            if (bucket >= 0 && bucket == RarityBucket(base) && Luma(now) < Luma(base) + 25) bucket = -1;
-            run = (bucket >= 0 && bucket == prev) ? run + 1 : (bucket >= 0 ? 1 : 0);
-            prev = bucket;
-            if (bucket >= 0 && run > runOut) {
-                runOut = run;
-                best = bucket;
-            }
+double ColourDistance(const int a[3], const int b[3]) {
+    const double dr = a[0] - b[0], dg = a[1] - b[1], db = a[2] - b[2];
+    return std::sqrt(dr * dr + dg * dg + db * db);
+}
+
+// How much row y stands out as a thin line: different in colour from the
+// rows 2 above and below, which themselves look alike. Works for a bright
+// grey line (Common) as well as a dark red one (Mythic).
+double LineStrength(const uint32_t* px, int w, int h, int y, int colour[3]) {
+    int up[3], down[3];
+    if (!RowMedian(px, w, y, colour) || !RowMedian(px, w, std::max(0, y - 2), up) ||
+        !RowMedian(px, w, std::min(h - 1, y + 2), down)) {
+        return -1e9;
+    }
+    return (ColourDistance(colour, up) + ColourDistance(colour, down)) / 2.0 - ColourDistance(up, down) / 2.0;
+}
+
+// frame = the clearest capture of the message, baseline = same region just
+// before T. Finds the banner's top line (a line that is new compared to the
+// baseline) and returns the nearest rarity sample for that background.
+int ClassifyRarity(const std::vector<uint32_t>& frame, const std::vector<uint32_t>& baseline, int w, int h) {
+    if (w <= 0 || h <= 4 || static_cast<int>(frame.size()) != w * h ||
+        static_cast<int>(baseline.size()) != w * h) {
+        return kRarityCommon;
+    }
+    double bestScore = -1e9;
+    int bestY = -1;
+    int bestColour[3] = {};
+    for (int y = 2; y < h * 45 / 100; ++y) {
+        int colour[3], unused[3];
+        const double now = LineStrength(frame.data(), w, h, y, colour);
+        const double before = LineStrength(baseline.data(), w, h, y, unused);
+        const double score = now - std::max(0.0, before);
+        if (score > bestScore) {
+            bestScore = score;
+            bestY = y;
+            std::copy(colour, colour + 3, bestColour);
         }
     }
-    // A short run is just icon colour (e.g. the orange fish on a Common
-    // message gives ~35 px; real banners give 87-100 px on the same scale),
-    // so without a line over 30% of the width the banner is grey: Common.
-    if (runOut < std::max(12, w * 3 / 10)) return kRarityCommon;
+    int background[3];
+    if (bestY < 0 || !RowMedian(baseline.data(), w, bestY, background)) return kRarityCommon;
+    const bool water = !(background[0] > background[2] + 15); // brown deck is clearly red > blue
+    int best = kRarityCommon;
+    double bestDistance = 1e9;
+    for (const RarityPrototype& proto : kRarityPrototypes) {
+        if (proto.water != water) continue;
+        const int sample[3] = {proto.r, proto.g, proto.b};
+        const double d = ColourDistance(bestColour, sample);
+        if (d < bestDistance) {
+            bestDistance = d;
+            best = proto.rarity;
+        }
+    }
     return best;
 }
 
@@ -1065,14 +1095,14 @@ DWORD WINAPI TrackerThread(void*) {
     int rarityCounts[kRarityCount] = {};
     int lastRarity = -1;
     int attemptRarity = kRarityCommon; // best classification during this attempt
-    int attemptRarityRun = -1;
-    std::vector<uint32_t> attemptRarityFrame; // frame the rarity was read from (debug capture)
+    int attemptBestScore = -1;
+    std::vector<uint32_t> attemptRarityFrame; // clearest frame of the message (rarity is read from it)
     // Snapshot of the collect-message region right before T goes down.
     auto takeCollectBaseline = [&]() {
         collectSeen = false;
         collectHitSinceMs = -1.0;
         attemptRarity = kRarityCommon;
-        attemptRarityRun = -1;
+        attemptBestScore = -1;
         attemptRarityFrame.clear();
         collectBaseline.clear();
         if (collectReady && collectSurface.Grab(collectRect.left, collectRect.top)) {
@@ -1089,17 +1119,15 @@ DWORD WINAPI TrackerThread(void*) {
         if (!collectSurface.Grab(collectRect.left, collectRect.top)) return;
         const int area = collectSurface.width * collectSurface.height;
         const int needed = std::max(20, area / 50); // 2% of the region
-        if (CollectMessageScore(collectSurface, collectBaseline) >= needed) {
+        const int score = CollectMessageScore(collectSurface, collectBaseline);
+        if (score >= needed) {
             if (collectHitSinceMs < 0.0) collectHitSinceMs = nowMs;
             if (nowMs - collectHitSinceMs >= kCollectConfirmMs) collectSeen = true;
-            int run = 0;
-            const int rarity = ClassifyRarity(collectSurface, collectBaseline, run);
-            if (run > attemptRarityRun) {
-                attemptRarityRun = run;
-                attemptRarity = rarity;
-                if (gMinigameLog.load()) {
-                    attemptRarityFrame.assign(collectSurface.pixels, collectSurface.pixels + area);
-                }
+            // The message fades in and out; the rarity line is clearest on the
+            // frame with the most (fully opaque) text.
+            if (score > attemptBestScore) {
+                attemptBestScore = score;
+                attemptRarityFrame.assign(collectSurface.pixels, collectSurface.pixels + area);
             }
         } else if (!collectSeen) {
             collectHitSinceMs = -1.0;
@@ -1517,6 +1545,8 @@ DWORD WINAPI TrackerThread(void*) {
                 if (outcome == 1) {
                     ++totalCatches;
                     if (checking) {
+                        attemptRarity = ClassifyRarity(attemptRarityFrame, collectBaseline,
+                                                       collectSurface.width, collectSurface.height);
                         lastRarity = attemptRarity;
                         ++rarityCounts[attemptRarity];
                         const int area = collectSurface.width * collectSurface.height;
