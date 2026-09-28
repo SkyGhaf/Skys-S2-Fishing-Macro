@@ -152,6 +152,8 @@ struct Telemetry {
     bool collectCheckReady = false;
     int rarityCounts[4] = {}; // indexed by Rarity (kRarityCount)
     int lastRarity = -1;
+    int oreCount = 0;
+    bool lastWasOre = false;
     int confidence = 0;
     ControlState state = ControlState::Paused;
     Phase phase = Phase::Cast;
@@ -948,6 +950,35 @@ int ClassifyRarity(const std::vector<uint32_t>& frame, const std::vector<uint32_
     return best;
 }
 
+// ORE - the item everyone fishes for - is a Mythic with a very short name.
+// Measured on real collects (1440p): "Ore" is 36 px wide, the shortest other
+// item ("Coral") 56 px, other Mythics ("Lost Cape", "Lost Mask") ~101 px and
+// "Refinement Ore" (Rare anyway) ~170 px. The limit sits in between and
+// scales with the screen height, since Roblox scales its UI with the window.
+int ItemNameWidth(const std::vector<uint32_t>& frame, int w, int h) {
+    if (static_cast<int>(frame.size()) != w * h) return 0;
+    int first = -1, last = -1;
+    for (int x = w * 15 / 100; x < w; ++x) { // skip the item icon on the left
+        for (int y = h * 20 / 100; y < h * 62 / 100; ++y) { // name line, above "x1"
+            const uint32_t p = frame[y * w + x];
+            int r, g, b;
+            ReadRgb(p, r, g, b);
+            if (Luma(p) >= 200 && std::max({r, g, b}) - std::min({r, g, b}) < 60) {
+                if (first < 0) first = x;
+                last = x;
+                break;
+            }
+        }
+    }
+    return first < 0 ? 0 : last - first + 1;
+}
+
+bool IsOreMessage(const std::vector<uint32_t>& frame, int w, int h) {
+    const double scale = GetSystemMetrics(SM_CYSCREEN) / 1440.0;
+    const int width = ItemNameWidth(frame, w, h);
+    return width >= 12 * scale && width <= 46 * scale;
+}
+
 // <exe dir>\logs (created if needed).
 std::wstring LogsDir() {
     wchar_t modulePath[MAX_PATH];
@@ -1094,6 +1125,8 @@ DWORD WINAPI TrackerThread(void*) {
     double collectHitSinceMs = -1.0;
     int rarityCounts[kRarityCount] = {};
     int lastRarity = -1;
+    int oreCount = 0;
+    bool lastWasOre = false;
     int attemptRarity = kRarityCommon; // best classification during this attempt
     int attemptBestScore = -1;
     std::vector<uint32_t> attemptRarityFrame; // clearest frame of the message (rarity is read from it)
@@ -1193,6 +1226,8 @@ DWORD WINAPI TrackerThread(void*) {
         current.collectCheckReady = collectReady;
         std::copy(rarityCounts, rarityCounts + kRarityCount, current.rarityCounts);
         current.lastRarity = lastRarity;
+        current.oreCount = oreCount;
+        current.lastWasOre = lastWasOre;
         current.state =current.enabled ? ControlState::Waiting : ControlState::Paused;
 
         if (!current.enabled || !captureReady) {
@@ -1549,6 +1584,9 @@ DWORD WINAPI TrackerThread(void*) {
                                                        collectSurface.width, collectSurface.height);
                         lastRarity = attemptRarity;
                         ++rarityCounts[attemptRarity];
+                        lastWasOre = attemptRarity == kRarityMythic &&
+                            IsOreMessage(attemptRarityFrame, collectSurface.width, collectSurface.height);
+                        if (lastWasOre) ++oreCount;
                         const int area = collectSurface.width * collectSurface.height;
                         if (gMinigameLog.load() && static_cast<int>(attemptRarityFrame.size()) == area &&
                             static_cast<int>(collectBaseline.size()) == area) {
@@ -1557,7 +1595,7 @@ DWORD WINAPI TrackerThread(void*) {
                             wchar_t name[96];
                             swprintf_s(name, L"\\collect_%04u%02u%02u_%02u%02u%02u_%s",
                                        st.wYear, st.wMonth, st.wDay, st.wHour, st.wMinute, st.wSecond,
-                                       kRarityNames[attemptRarity]);
+                                       lastWasOre ? L"ORE" : kRarityNames[attemptRarity]);
                             const std::wstring base = LogsDir() + name;
                             SaveBmp(base + L"_before.bmp", collectBaseline.data(),
                                     collectSurface.width, collectSurface.height);
@@ -1566,7 +1604,10 @@ DWORD WINAPI TrackerThread(void*) {
                         }
                     }
                 }
-                else ++failedCollects;
+                else {
+                    ++failedCollects;
+                    lastWasOre = false;
+                }
                 if (checking) lastCollectDetected = outcome;
                 ++catchesSinceRespawn;
                 phase = Phase::Cast;
@@ -1588,6 +1629,8 @@ DWORD WINAPI TrackerThread(void*) {
                 current.lastCollectDetected = lastCollectDetected;
                 std::copy(rarityCounts, rarityCounts + kRarityCount, current.rarityCounts);
                 current.lastRarity = lastRarity;
+                current.oreCount = oreCount;
+                current.lastWasOre = lastWasOre;
                 current.catchesSinceRespawn = catchesSinceRespawn;
                 phaseChangedAt = GetTickCount64();
             }
@@ -1914,7 +1957,7 @@ void DrawFishingTab(Gdiplus::Graphics& g, const Telemetry& t) {
 
     // --- Rarity card ---------------------------------------------------------------
     DrawCard(g, RectF(18, 410, 344, 92));
-    Text(g, L"CATCHES BY RARITY", gFontLabel, ui::kText, RectF(34, 420, 180, 16));
+    Text(g, L"ORE & RARITY", gFontLabel, ui::kText, RectF(34, 420, 180, 16));
     if (!t.collectCheckReady) {
         Text(g, L"item check off", gFontSmall, ui::kWarn, RectF(200, 420, 146, 16),
              Gdiplus::StringAlignmentFar);
@@ -1922,17 +1965,26 @@ void DrawFishingTab(Gdiplus::Graphics& g, const Telemetry& t) {
         Text(g, L"last: no item", gFontSmall, ui::kBad, RectF(200, 420, 146, 16),
              Gdiplus::StringAlignmentFar);
     } else if (t.lastRarity >= 0) {
-        swprintf_s(line, L"last: %s \u2713", kRarityNames[t.lastRarity]);
+        swprintf_s(line, L"last: %s \u2713", t.lastWasOre ? L"ORE" : kRarityNames[t.lastRarity]);
         Text(g, line, gFontSmall, ui::kSoft, RectF(200, 420, 146, 16), Gdiplus::StringAlignmentFar);
+    }
+    {
+        // ORE block (left): the item everyone fishes for.
+        const RectF oreBox(34, 442, 96, 52);
+        if (t.oreCount > 0 || (t.lastWasOre && t.lastCollectDetected == 1)) FillGradient(g, oreBox, 12.0f);
+        else FillInset(g, oreBox, 12.0f);
+        Text(g, L"ORE", gFontLabel, ui::kText, RectF(44, 446, 80, 16));
+        swprintf_s(line, L"%d", t.oreCount);
+        Text(g, line, gFontBig, ui::kText, RectF(42, 460, 84, 32));
     }
     {
         const Gdiplus::Color dots[kRarityCount] = {
             Gdiplus::Color(255, 248, 82, 82), Gdiplus::Color(255, 250, 190, 50),
             Gdiplus::Color(255, 70, 150, 255), Gdiplus::Color(255, 165, 168, 185)};
         for (int i = 0; i < kRarityCount; ++i) {
-            const float cx = 34.0f + (i % 2) * 160.0f;
+            const float cx = 138.0f + (i % 2) * 106.0f;
             const float cy = 442.0f + (i / 2) * 28.0f;
-            const RectF chip(cx, cy, 152.0f, 24.0f);
+            const RectF chip(cx, cy, 102.0f, 24.0f);
             FillInset(g, chip, 12.0f);
             if (t.lastRarity == i && t.lastCollectDetected == 1) {
                 Gdiplus::Pen ring(dots[i], 1.5f);
@@ -1943,9 +1995,9 @@ void DrawFishingTab(Gdiplus::Graphics& g, const Telemetry& t) {
             Gdiplus::SolidBrush dot(dots[i]);
             g.FillEllipse(&dot, RectF(cx + 9.0f, cy + 8.0f, 8.0f, 8.0f));
             Text(g, kRarityNames[i], gFontSmall, t.collectCheckReady ? ui::kSoft : ui::kMuted,
-                 RectF(cx + 22.0f, cy, 80.0f, 24.0f));
+                 RectF(cx + 20.0f, cy, 58.0f, 24.0f));
             swprintf_s(line, L"%d", t.rarityCounts[i]);
-            Text(g, line, gFontLabel, ui::kText, RectF(cx + 100.0f, cy, 42.0f, 24.0f),
+            Text(g, line, gFontLabel, ui::kText, RectF(cx + 72.0f, cy, 24.0f, 24.0f),
                  Gdiplus::StringAlignmentFar);
         }
     }
@@ -1966,7 +2018,7 @@ void DrawFishingTab(Gdiplus::Graphics& g, const Telemetry& t) {
                    RectF(18, 578, 344, 18));
     } else {
         const POINT cast = GetCastPoint();
-        swprintf_s(line, L"Cast point (%ld, %ld)  ·  v2.4", cast.x, cast.y);
+        swprintf_s(line, L"Cast point (%ld, %ld)  ·  v2.5", cast.x, cast.y);
         TextCenter(g, line, gFontSmall, ui::kMuted, RectF(18, 578, 344, 18));
     }
 }

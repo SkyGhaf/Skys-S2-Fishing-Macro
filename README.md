@@ -23,6 +23,9 @@ on your own screen, so it runs at any resolution.
 - **Rarity counter:** each collected item is sorted by the colour of its message banner:
   **Mythic** (red), **Legendary** (gold), **Rare** (blue) or **Common** (grey). The counts show
   on the Fishing tab.
+- **ORE counter:** Ore is a Mythic with a very short name. A Mythic whose name is at most ~46 px
+  wide at 1440p (scaled for other resolutions) counts as **ORE**. "Ore" is 36 px; the shortest
+  other item is 56 px.
 - **Equip on start:** every time you press Start it quickly taps the *correction key* (default
   `1`) and then the *rod key* (default `5`). You can change both in the **Hotkeys** tab.
 - **Collect delay / Hold T time:** choose how long to wait after the minigame before holding **T**,
