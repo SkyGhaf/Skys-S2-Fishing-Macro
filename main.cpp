@@ -2165,11 +2165,18 @@ void DrawCount(Gdiplus::Graphics& g, long long value, const RectF& r, const Gdip
     wchar_t text[32];
     if (value >= 10000) swprintf_s(text, L"%.1fk", value / 1000.0);
     else swprintf_s(text, L"%lld", value);
+    // Typographic format: no extra padding around the text and never an
+    // ellipsis - a count must always show all its digits ("1344", not "13...").
+    Gdiplus::StringFormat format(Gdiplus::StringFormat::GenericTypographic());
+    format.SetAlignment(align);
+    format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+    format.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap | Gdiplus::StringFormatFlagsNoClip);
+    format.SetTrimming(Gdiplus::StringTrimmingNone);
     Gdiplus::RectF bounds;
-    g.MeasureString(text, -1, font, Gdiplus::PointF(0, 0), &bounds);
-    const Gdiplus::Font* use = font;
-    if (bounds.Width > r.Width + 4.0f) use = gFontSmall;
-    Text(g, text, use, color, r, align);
+    g.MeasureString(text, -1, font, Gdiplus::PointF(0, 0), &format, &bounds);
+    const Gdiplus::Font* use = bounds.Width > r.Width ? gFontSmall : font;
+    Gdiplus::SolidBrush brush(color);
+    g.DrawString(text, -1, use, r, &format, &brush);
 }
 
 void DrawCalendarIcon(Gdiplus::Graphics& g, float x, float y, const Gdiplus::Color& c) {
@@ -2244,9 +2251,20 @@ void DrawOreRarityCard(Gdiplus::Graphics& g, const Telemetry& t, float top, bool
             Gdiplus::Pen outline(ui::kMuted, 1.0f); // black dot needs an outline on the dark chip
             g.DrawEllipse(&outline, RectF(cx + 9.0f, cy + 6.0f, 8.0f, 8.0f));
         }
-        Text(g, kRarityNames[i], gFontSmall, (!live || t.collectCheckReady) ? ui::kSoft : ui::kMuted,
-             RectF(cx + 21.0f, cy, chip.Width - 49.0f, 20.0f));
-        DrawCount(g, t.rarityCounts[i], RectF(cx + chip.Width - 34.0f, cy, 28.0f, 20.0f), gFontLabel, ui::kText);
+        // Name gets whatever the count leaves free; both drawn without padding.
+        Gdiplus::StringFormat tight(Gdiplus::StringFormat::GenericTypographic());
+        tight.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+        tight.SetFormatFlags(Gdiplus::StringFormatFlagsNoWrap);
+        tight.SetTrimming(Gdiplus::StringTrimmingEllipsisCharacter);
+        wchar_t countText[32];
+        swprintf_s(countText, L"%d", t.rarityCounts[i]);
+        Gdiplus::RectF countBounds;
+        g.MeasureString(countText, -1, gFontLabel, Gdiplus::PointF(0, 0), &tight, &countBounds);
+        const float countWidth = std::min(countBounds.Width, 34.0f);
+        Gdiplus::SolidBrush nameBrush((!live || t.collectCheckReady) ? ui::kSoft : ui::kMuted);
+        g.DrawString(kRarityNames[i], -1, gFontSmall,
+                     RectF(cx + 21.0f, cy, chip.Width - 21.0f - countWidth - 12.0f, 20.0f), &tight, &nameBrush);
+        DrawCount(g, t.rarityCounts[i], RectF(cx + chip.Width - 8.0f - 34.0f, cy, 34.0f, 20.0f), gFontLabel, ui::kText);
     }
 }
 
