@@ -21,6 +21,7 @@
 #include <mutex>
 #include <string>
 #include <vector>
+#include <ctime>
 
 #include "fish_icons.h"
 #include "wen_icon.h"
@@ -158,6 +159,7 @@ struct Telemetry {
     int lastRarity = -1;
     int oreCount = 0;
     bool lastWasOre = false;
+    double runningMs = 0.0; // time actually spent fishing this session (not paused)
     int confidence = 0;
     ControlState state = ControlState::Paused;
     Phase phase = Phase::Cast;
@@ -178,6 +180,31 @@ std::atomic<WORD> gRodKeyVk{static_cast<WORD>('5')};
 std::atomic<int> gRespawnEveryCatches{kDefaultRespawnEveryCatches};
 std::mutex gTelemetryMutex;
 Telemetry gTelemetry;
+
+// Fish sessions: one line of numbers per session in
+// SkysS2FishingMacro_sessions.txt next to the exe (saved on exit and every
+// minute while running, so an accidental close or crash loses nothing).
+struct SessionRecord {
+    int id = 0;
+    long long start = 0;     // unix time of the first Start
+    long long end = 0;       // unix time of the last save
+    long long runningMs = 0; // time actually fishing
+    int catches = 0;
+    int noItem = 0;
+    int ore = 0;
+    int rarity[5] = {};      // Impossible, Mythic, Legendary, Rare, Common
+};
+std::vector<SessionRecord> gSessions; // UI thread only, sorted by id
+int gCurrentSessionId = 1;
+long long gCurrentSessionStart = 0;   // 0 = not started fishing yet this run
+int gRestorePromptId = -1;            // session offered for continuing at startup
+int gSessionPage = 0;
+int gSessionOpenId = -1;              // session shown in detail on the Sessions tab
+bool gSessionDeleteArmed = false;     // "Delete" needs a second click
+// Hand-off of a continued session's numbers to the tracker thread.
+std::mutex gRestoreMutex;
+bool gRestorePending = false;
+SessionRecord gRestoreData;
 HWND gWindow = nullptr;
 HWND gToggleButton = nullptr;
 HWND gExitButton = nullptr;
@@ -1185,6 +1212,8 @@ DWORD WINAPI TrackerThread(void*) {
     int lastRarity = -1;
     int oreCount = 0;
     bool lastWasOre = false;
+    double runningMs = 0.0;          // fishing time this session
+    double lastLoopMs = PreciseMs();
     int attemptRarity = kRarityCommon; // best classification during this attempt
     int attemptBestScore = -1;
     std::vector<uint32_t> attemptRarityFrame; // clearest frame of the message (rarity is read from it)
@@ -1289,8 +1318,26 @@ DWORD WINAPI TrackerThread(void*) {
         }
         const bool captureReady = barReady && exitReady;
 
+        // Continue a previous session: take over its numbers.
+        {
+            std::lock_guard<std::mutex> lock(gRestoreMutex);
+            if (gRestorePending) {
+                gRestorePending = false;
+                totalCatches = gRestoreData.catches;
+                failedCollects = gRestoreData.noItem;
+                oreCount = gRestoreData.ore;
+                for (int i = 0; i < kRarityCount; ++i) rarityCounts[i] = gRestoreData.rarity[i];
+                runningMs = static_cast<double>(gRestoreData.runningMs);
+            }
+        }
+        // Real elapsed time (not the clamped dtMs): casting/collecting can
+        // block this loop for a second or more.
+        if (gEnabled.load() && !gBaitRunning.load()) runningMs += nowMs - lastLoopMs;
+        lastLoopMs = nowMs;
+
         Telemetry current{};
         current.enabled = gEnabled.load();
+        current.runningMs = runningMs;
         current.fps = fpsAverage;
         current.captureReady = captureReady;
         current.totalCatches = totalCatches;
@@ -1810,6 +1857,134 @@ void StopBaitBuying() {
 }
 
 // ---------------------------------------------------------------------------
+// Fish sessions storage.
+// ---------------------------------------------------------------------------
+std::wstring SessionsPath() {
+    wchar_t modulePath[MAX_PATH];
+    const DWORD len = GetModuleFileNameW(nullptr, modulePath, MAX_PATH);
+    std::wstring dir(modulePath, (len > 0 && len < MAX_PATH) ? len : 0);
+    return dir.substr(0, dir.find_last_of(L"\\/") + 1) + L"SkysS2FishingMacro_sessions.txt";
+}
+
+void LoadSessions() {
+    gSessions.clear();
+    FILE* f = _wfopen(SessionsPath().c_str(), L"r");
+    if (!f) return;
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+        SessionRecord r;
+        if (sscanf(line, "%d|%lld|%lld|%lld|%d|%d|%d|%d|%d|%d|%d|%d", &r.id, &r.start, &r.end, &r.runningMs,
+                   &r.catches, &r.noItem, &r.ore, &r.rarity[0], &r.rarity[1], &r.rarity[2], &r.rarity[3],
+                   &r.rarity[4]) == 12) {
+            gSessions.push_back(r);
+        }
+    }
+    fclose(f);
+    std::sort(gSessions.begin(), gSessions.end(),
+              [](const SessionRecord& a, const SessionRecord& b) { return a.id < b.id; });
+}
+
+void WriteSessions() {
+    FILE* f = _wfopen(SessionsPath().c_str(), L"w");
+    if (!f) return;
+    fprintf(f, "# id|start|end|running_ms|catches|no_item|ore|impossible|mythic|legendary|rare|common\n");
+    for (const SessionRecord& r : gSessions) {
+        fprintf(f, "%d|%lld|%lld|%lld|%d|%d|%d|%d|%d|%d|%d|%d\n", r.id, r.start, r.end, r.runningMs, r.catches,
+                r.noItem, r.ore, r.rarity[0], r.rarity[1], r.rarity[2], r.rarity[3], r.rarity[4]);
+    }
+    fclose(f);
+}
+
+SessionRecord* FindSession(int id) {
+    for (SessionRecord& r : gSessions) {
+        if (r.id == id) return &r;
+    }
+    return nullptr;
+}
+
+// Writes the running session into the list (insert or update). Nothing is
+// saved until fishing was actually started and something happened.
+void SaveCurrentSession() {
+    Telemetry t;
+    {
+        std::lock_guard<std::mutex> lock(gTelemetryMutex);
+        t = gTelemetry;
+    }
+    if (gCurrentSessionStart == 0) return;
+    if (t.runningMs < 60000.0 && t.totalCatches == 0 && t.failedCollects == 0) return;
+    SessionRecord r;
+    r.id = gCurrentSessionId;
+    r.start = gCurrentSessionStart;
+    r.end = static_cast<long long>(time(nullptr));
+    r.runningMs = static_cast<long long>(t.runningMs);
+    r.catches = t.totalCatches;
+    r.noItem = t.failedCollects;
+    r.ore = t.oreCount;
+    for (int i = 0; i < 5; ++i) r.rarity[i] = t.rarityCounts[i];
+    SessionRecord* existing = FindSession(r.id);
+    // A continued session that hasn't fished since keeps its old end time.
+    if (existing && existing->runningMs == r.runningMs && existing->catches == r.catches &&
+        existing->noItem == r.noItem) {
+        return;
+    }
+    if (existing) *existing = r;
+    else gSessions.push_back(r);
+    std::sort(gSessions.begin(), gSessions.end(),
+              [](const SessionRecord& a, const SessionRecord& b) { return a.id < b.id; });
+    WriteSessions();
+}
+
+// Continue a saved session: its numbers go back into the Fishing tab and it
+// keeps its number; saving later updates that same entry.
+void ContinueSession(int id) {
+    const SessionRecord* r = FindSession(id);
+    if (!r) return;
+    {
+        std::lock_guard<std::mutex> lock(gRestoreMutex);
+        gRestoreData = *r;
+        gRestorePending = true;
+    }
+    gCurrentSessionId = r->id;
+    gCurrentSessionStart = r->start;
+}
+
+void DeleteSession(int id) {
+    gSessions.erase(std::remove_if(gSessions.begin(), gSessions.end(),
+                                   [id](const SessionRecord& r) { return r.id == id; }),
+                    gSessions.end());
+    WriteSessions();
+    if (gRestorePromptId == id) gRestorePromptId = -1;
+}
+
+// "5h 12m" / "12m" / "45s"
+std::wstring FormatHoursMinutes(long long ms) {
+    const long long minutes = ms / 60000;
+    wchar_t buf[32];
+    if (minutes >= 60) swprintf_s(buf, L"%lldh %02lldm", minutes / 60, minutes % 60);
+    else if (minutes > 0) swprintf_s(buf, L"%lldm", minutes);
+    else swprintf_s(buf, L"%llds", ms / 1000);
+    return buf;
+}
+
+std::wstring FormatDate(long long unixTime) {
+    const time_t tt = static_cast<time_t>(unixTime);
+    tm local{};
+    localtime_s(&local, &tt);
+    wchar_t buf[32];
+    wcsftime(buf, 32, L"%d %b %Y", &local);
+    return buf;
+}
+
+std::wstring FormatClock(long long unixTime) {
+    const time_t tt = static_cast<time_t>(unixTime);
+    tm local{};
+    localtime_s(&local, &tt);
+    wchar_t buf[16];
+    wcsftime(buf, 16, L"%H:%M", &local);
+    return buf;
+}
+
+// ---------------------------------------------------------------------------
 // Sky's S2 Fishing Macro - custom-drawn UI.
 // Everything below the title bar is painted with GDI+ (dark navy cards with a
 // soft shadow, teal->blue gradient for anything active) and hit-tested by
@@ -1842,16 +2017,19 @@ Gdiplus::Font* gFontButton = nullptr;
 Gdiplus::Font* gFontLabel = nullptr;
 Gdiplus::Font* gFontBody = nullptr;
 Gdiplus::Font* gFontSmall = nullptr;
+Gdiplus::Font* gFontTab = nullptr;
 HBRUSH gInputBrush = nullptr;
 
 enum HitId {
     kHitNone = 0,
-    kHitTab0 = 1, kHitTab1, kHitTab2, kHitTab3, kHitTab4,
+    kHitTab0 = 1, kHitTab1, kHitTab2, kHitTab3, kHitTab4, kHitTab5,
     kHitStart = 10, kHitExit, kHitClose, kHitRespawnToggle, kHitMinimize,
     kHitBindToggle = 20, kHitBindQuit, kHitBindCorrection, kHitBindRod, kHitBindBait,
     kHitCalCast = 30, kHitCalBar, kHitCalExit, kHitLogToggle, kHitCalCollect,
     kHitBaitStart = 40, kHitBaitPreset0, // presets: kHitBaitPreset0 + 0..4
     kHitBaitCal0 = 50,                   // calibration: kHitBaitCal0 + 0..6
+    kHitSessRow0 = 60,                   // session list rows: kHitSessRow0 + 0..6
+    kHitSessPrev = 70, kHitSessNext, kHitSessBack, kHitSessDelete, kHitRestoreYes, kHitRestoreNo,
 };
 struct HitRegion {
     RECT rect;
@@ -1980,6 +2158,98 @@ std::wstring HotkeyHint() {
     return L"( " + KeyDisplayName(gToggleHotkeyVk.load()) + L" )";
 }
 
+// A count that always fits its box: smaller font when needed, "12.3k" from
+// 10,000 up (the Rare chip overflowed past 1,000).
+void DrawCount(Gdiplus::Graphics& g, long long value, const RectF& r, const Gdiplus::Font* font,
+               const Gdiplus::Color& color, Gdiplus::StringAlignment align = Gdiplus::StringAlignmentFar) {
+    wchar_t text[32];
+    if (value >= 10000) swprintf_s(text, L"%.1fk", value / 1000.0);
+    else swprintf_s(text, L"%lld", value);
+    Gdiplus::RectF bounds;
+    g.MeasureString(text, -1, font, Gdiplus::PointF(0, 0), &bounds);
+    const Gdiplus::Font* use = font;
+    if (bounds.Width > r.Width + 4.0f) use = gFontSmall;
+    Text(g, text, use, color, r, align);
+}
+
+void DrawCalendarIcon(Gdiplus::Graphics& g, float x, float y, const Gdiplus::Color& c) {
+    Gdiplus::Pen pen(c, 1.3f);
+    Gdiplus::GraphicsPath path;
+    AddRoundRect(path, RectF(x, y + 2, 12, 11), 2.5f);
+    g.DrawPath(&pen, &path);
+    Gdiplus::SolidBrush brush(c);
+    g.FillRectangle(&brush, RectF(x, y + 2, 12, 3.5f));
+    g.DrawLine(&pen, x + 3.5f, y, x + 3.5f, y + 3.5f);
+    g.DrawLine(&pen, x + 8.5f, y, x + 8.5f, y + 3.5f);
+}
+
+void DrawClockIcon(Gdiplus::Graphics& g, float x, float y, const Gdiplus::Color& c) {
+    Gdiplus::Pen pen(c, 1.3f);
+    g.DrawEllipse(&pen, RectF(x, y + 1, 12, 12));
+    g.DrawLine(&pen, x + 6, y + 7, x + 6, y + 3.5f);
+    g.DrawLine(&pen, x + 6, y + 7, x + 9, y + 8.5f);
+}
+
+// ORE & rarity card, shared by the Fishing tab (live) and a saved session.
+void DrawOreRarityCard(Gdiplus::Graphics& g, const Telemetry& t, float top, bool live) {
+    wchar_t line[64];
+    DrawCard(g, RectF(18, top, 344, 96));
+    Text(g, L"ORE & RARITY", gFontLabel, ui::kText, RectF(34, top + 6, 180, 16));
+    if (live) {
+        if (!t.collectCheckReady) {
+            Text(g, L"item check off", gFontSmall, ui::kWarn, RectF(200, top + 6, 146, 16),
+                 Gdiplus::StringAlignmentFar);
+        } else if (t.lastCollectDetected == 0) {
+            Text(g, L"last: no item", gFontSmall, ui::kBad, RectF(200, top + 6, 146, 16),
+                 Gdiplus::StringAlignmentFar);
+        } else if (t.lastRarity >= 0) {
+            swprintf_s(line, L"last: %s ✓", t.lastWasOre ? L"ORE" : kRarityNames[t.lastRarity]);
+            Text(g, line, gFontSmall, ui::kSoft, RectF(200, top + 6, 146, 16), Gdiplus::StringAlignmentFar);
+        }
+    }
+    {
+        // ORE block (left): the item everyone fishes for, with ORE per hour.
+        const RectF oreBox(34, top + 26, 82, 64);
+        if (t.oreCount > 0 || (t.lastWasOre && t.lastCollectDetected == 1)) FillGradient(g, oreBox, 12.0f);
+        else FillInset(g, oreBox, 12.0f);
+        Text(g, L"ORE", gFontLabel, ui::kText, RectF(42, top + 31, 40, 16));
+        if (t.runningMs >= 60000.0) {
+            swprintf_s(line, L"%.1f/h", t.oreCount / (t.runningMs / 3600000.0));
+            Text(g, line, gFontSmall, Gdiplus::Color(230, 255, 255, 255), RectF(70, top + 31, 42, 16),
+                 Gdiplus::StringAlignmentFar);
+        }
+        DrawCount(g, t.oreCount, RectF(40, top + 48, 72, 34), gFontBig, ui::kText,
+                  Gdiplus::StringAlignmentNear);
+    }
+    const Gdiplus::Color dots[kRarityCount] = {
+        Gdiplus::Color(255, 20, 20, 26), Gdiplus::Color(255, 248, 82, 82),
+        Gdiplus::Color(255, 250, 190, 50), Gdiplus::Color(255, 70, 150, 255),
+        Gdiplus::Color(255, 165, 168, 185)};
+    for (int i = 0; i < kRarityCount; ++i) {
+        // Impossible gets the full top row, the others a 2x2 grid below it.
+        const bool first = i == kRarityImpossible;
+        const float cx = first ? 122.0f : 122.0f + ((i - 1) % 2) * 114.0f;
+        const float cy = first ? top + 26 : top + 48 + ((i - 1) / 2) * 22.0f;
+        const RectF chip(cx, cy, first ? 224.0f : 110.0f, 20.0f);
+        FillInset(g, chip, 10.0f);
+        if (live && t.lastRarity == i && t.lastCollectDetected == 1) {
+            Gdiplus::Pen ring(first ? ui::kText : dots[i], 1.5f);
+            Gdiplus::GraphicsPath path;
+            AddRoundRect(path, chip, 10.0f);
+            g.DrawPath(&ring, &path);
+        }
+        Gdiplus::SolidBrush dot(dots[i]);
+        g.FillEllipse(&dot, RectF(cx + 9.0f, cy + 6.0f, 8.0f, 8.0f));
+        if (first) {
+            Gdiplus::Pen outline(ui::kMuted, 1.0f); // black dot needs an outline on the dark chip
+            g.DrawEllipse(&outline, RectF(cx + 9.0f, cy + 6.0f, 8.0f, 8.0f));
+        }
+        Text(g, kRarityNames[i], gFontSmall, (!live || t.collectCheckReady) ? ui::kSoft : ui::kMuted,
+             RectF(cx + 21.0f, cy, chip.Width - 49.0f, 20.0f));
+        DrawCount(g, t.rarityCounts[i], RectF(cx + chip.Width - 34.0f, cy, 28.0f, 20.0f), gFontLabel, ui::kText);
+    }
+}
+
 void DrawFishingTab(Gdiplus::Graphics& g, const Telemetry& t) {
     wchar_t line[160];
 
@@ -2067,8 +2337,7 @@ void DrawFishingTab(Gdiplus::Graphics& g, const Telemetry& t) {
     DrawCard(g, RectF(18, 234, 166, 76));
     Text(g, L"CATCHES", gFontLabel, ui::kText, RectF(32, 244, 120, 16));
     Text(g, L"item collected", gFontSmall, ui::kMuted, RectF(32, 259, 120, 14));
-    swprintf_s(line, L"%d", t.totalCatches);
-    Text(g, line, gFontBig, ui::kText, RectF(30, 274, 130, 32));
+    DrawCount(g, t.totalCatches, RectF(30, 274, 130, 32), gFontBig, ui::kText, Gdiplus::StringAlignmentNear);
     FillGradient(g, RectF(164, 250, 4, 44), 2.0f, true);
 
     DrawCard(g, RectF(196, 234, 166, 76));
@@ -2076,8 +2345,8 @@ void DrawFishingTab(Gdiplus::Graphics& g, const Telemetry& t) {
     // (catching nothing is possible) - the two look identical on screen.
     Text(g, L"NO ITEM", gFontLabel, ui::kText, RectF(210, 244, 130, 16));
     Text(g, L"failed / caught nothing", gFontSmall, ui::kMuted, RectF(210, 259, 140, 14));
-    swprintf_s(line, L"%d", t.failedCollects);
-    Text(g, line, gFontBig, t.failedCollects ? ui::kBad : ui::kText, RectF(208, 274, 130, 32));
+    DrawCount(g, t.failedCollects, RectF(208, 274, 130, 32), gFontBig, t.failedCollects ? ui::kBad : ui::kText,
+              Gdiplus::StringAlignmentNear);
     {
         Gdiplus::SolidBrush red(ui::kBad);
         FillRound(g, red, RectF(342, 250, 4, 44), 2.0f);
@@ -2102,59 +2371,7 @@ void DrawFishingTab(Gdiplus::Graphics& g, const Telemetry& t) {
     Text(g, line, gFontBig, respawnOn ? ui::kText : ui::kMuted, RectF(208, 362, 130, 32));
     if (respawnOn) FillGradient(g, RectF(342, 338, 4, 44), 2.0f, true);
 
-    // --- Rarity card ---------------------------------------------------------------
-    DrawCard(g, RectF(18, 410, 344, 96));
-    Text(g, L"ORE & RARITY", gFontLabel, ui::kText, RectF(34, 416, 180, 16));
-    if (!t.collectCheckReady) {
-        Text(g, L"item check off", gFontSmall, ui::kWarn, RectF(200, 416, 146, 16),
-             Gdiplus::StringAlignmentFar);
-    } else if (t.lastCollectDetected == 0) {
-        Text(g, L"last: no item", gFontSmall, ui::kBad, RectF(200, 416, 146, 16),
-             Gdiplus::StringAlignmentFar);
-    } else if (t.lastRarity >= 0) {
-        swprintf_s(line, L"last: %s ✓", t.lastWasOre ? L"ORE" : kRarityNames[t.lastRarity]);
-        Text(g, line, gFontSmall, ui::kSoft, RectF(200, 416, 146, 16), Gdiplus::StringAlignmentFar);
-    }
-    {
-        // ORE block (left): the item everyone fishes for.
-        const RectF oreBox(34, 436, 96, 64);
-        if (t.oreCount > 0 || (t.lastWasOre && t.lastCollectDetected == 1)) FillGradient(g, oreBox, 12.0f);
-        else FillInset(g, oreBox, 12.0f);
-        Text(g, L"ORE", gFontLabel, ui::kText, RectF(44, 442, 80, 16));
-        swprintf_s(line, L"%d", t.oreCount);
-        Text(g, line, gFontBig, ui::kText, RectF(42, 460, 84, 32));
-    }
-    {
-        const Gdiplus::Color dots[kRarityCount] = {
-            Gdiplus::Color(255, 20, 20, 26), Gdiplus::Color(255, 248, 82, 82),
-            Gdiplus::Color(255, 250, 190, 50), Gdiplus::Color(255, 70, 150, 255),
-            Gdiplus::Color(255, 165, 168, 185)};
-        for (int i = 0; i < kRarityCount; ++i) {
-            // Impossible gets the full top row, the others a 2x2 grid below it.
-            const bool top = i == kRarityImpossible;
-            const float cx = top ? 138.0f : 138.0f + ((i - 1) % 2) * 106.0f;
-            const float cy = top ? 436.0f : 458.0f + ((i - 1) / 2) * 22.0f;
-            const RectF chip(cx, cy, top ? 208.0f : 102.0f, 20.0f);
-            FillInset(g, chip, 10.0f);
-            if (t.lastRarity == i && t.lastCollectDetected == 1) {
-                Gdiplus::Pen ring(top ? ui::kText : dots[i], 1.5f);
-                Gdiplus::GraphicsPath path;
-                AddRoundRect(path, chip, 10.0f);
-                g.DrawPath(&ring, &path);
-            }
-            Gdiplus::SolidBrush dot(dots[i]);
-            g.FillEllipse(&dot, RectF(cx + 9.0f, cy + 6.0f, 8.0f, 8.0f));
-            if (top) {
-                Gdiplus::Pen outline(ui::kMuted, 1.0f); // black dot needs an outline on the dark chip
-                g.DrawEllipse(&outline, RectF(cx + 9.0f, cy + 6.0f, 8.0f, 8.0f));
-            }
-            Text(g, kRarityNames[i], gFontSmall, t.collectCheckReady ? ui::kSoft : ui::kMuted,
-                 RectF(cx + 22.0f, cy, 80.0f, 20.0f));
-            swprintf_s(line, L"%d", t.rarityCounts[i]);
-            Text(g, line, gFontLabel, ui::kText, RectF(cx + chip.Width - 34.0f, cy, 26.0f, 20.0f),
-                 Gdiplus::StringAlignmentFar);
-        }
-    }
+    DrawOreRarityCard(g, t, 410.0f, true);
 
     // --- Buttons -------------------------------------------------------------
     std::wstring start = (t.enabled ? L"PAUSE   " : L"START   ") + HotkeyHint();
@@ -2171,10 +2388,34 @@ void DrawFishingTab(Gdiplus::Graphics& g, const Telemetry& t) {
         TextCenter(g, L"Calibrating · see the Setup tab (Esc cancels)", gFontSmall, ui::kWarn,
                    RectF(18, 578, 344, 18));
     } else {
-        const POINT cast = GetCastPoint();
-        swprintf_s(line, L"Cast point (%ld, %ld)  ·  v2.6", cast.x, cast.y);
+        swprintf_s(line, L"Session #%d  ·  %ls fishing  ·  v2.7", gCurrentSessionId,
+                   FormatHoursMinutes(static_cast<long long>(t.runningMs)).c_str());
         TextCenter(g, line, gFontSmall, ui::kMuted, RectF(18, 578, 344, 18));
     }
+}
+
+// Startup question: continue the last session? Drawn over the fishing tiles.
+void DrawRestorePrompt(Gdiplus::Graphics& g) {
+    const SessionRecord* r = FindSession(gRestorePromptId);
+    if (!r) return;
+    wchar_t line[160];
+    const RectF card(26, 232, 328, 150);
+    Gdiplus::SolidBrush dim(Gdiplus::Color(150, 20, 21, 40));
+    g.FillRectangle(&dim, RectF(18, 226, 344, 280));
+    DrawCard(g, card, 16.0f);
+    Text(g, L"CONTINUE LAST SESSION?", gFontLabel, ui::kText, RectF(42, 244, 290, 16));
+    swprintf_s(line, L"Session #%d", r->id);
+    Text(g, line, gFontHead, ui::kText, RectF(42, 262, 290, 26));
+    DrawCalendarIcon(g, 42, 294, ui::kMuted);
+    Text(g, FormatDate(r->start).c_str(), gFontSmall, ui::kSoft, RectF(60, 292, 90, 16));
+    DrawClockIcon(g, 150, 294, ui::kMuted);
+    swprintf_s(line, L"%ls–%ls · %ls fishing", FormatClock(r->start).c_str(), FormatClock(r->end).c_str(),
+               FormatHoursMinutes(r->runningMs).c_str());
+    Text(g, line, gFontSmall, ui::kSoft, RectF(168, 292, 180, 16));
+    swprintf_s(line, L"%d catches · %d ORE · %d no item", r->catches, r->ore, r->noItem);
+    Text(g, line, gFontSmall, ui::kMuted, RectF(42, 312, 300, 16));
+    GradientButton(g, RectF(42, 336, 140, 34), L"Continue", kHitRestoreYes, 12.0f);
+    InsetButton(g, RectF(194, 336, 144, 34), L"New session", kHitRestoreNo, ui::kSoft, 12.0f);
 }
 
 // On/off switch drawn at the right of a settings row.
@@ -2437,6 +2678,126 @@ void DrawBaitTab(Gdiplus::Graphics& g) {
     }
 }
 
+// Sessions tab: numbered list of saved sessions (newest first), or one
+// session opened with all its stats.
+constexpr int kSessionsPerPage = 7;
+
+void DrawSessionDetail(Gdiplus::Graphics& g, const SessionRecord& r) {
+    wchar_t line[128];
+    DrawCard(g, RectF(18, 128, 344, 70));
+    swprintf_s(line, L"#%d", r.id);
+    const RectF badge(34, 142, 56, 42);
+    FillGradient(g, badge, 12.0f);
+    TextCenter(g, line, gFontHead, ui::kText, badge);
+    DrawCalendarIcon(g, 104, 143, ui::kMuted);
+    Text(g, FormatDate(r.start).c_str(), gFontBody, ui::kText, RectF(122, 140, 110, 18));
+    DrawClockIcon(g, 104, 165, ui::kMuted);
+    swprintf_s(line, L"%ls – %ls", FormatClock(r.start).c_str(), FormatClock(r.end).c_str());
+    Text(g, line, gFontBody, ui::kText, RectF(122, 162, 110, 18));
+    if (r.id == gCurrentSessionId) {
+        const RectF pill(294, 140, 52, 20);
+        FillGradient(g, pill, 10.0f);
+        TextCenter(g, L"LIVE", gFontLabel, ui::kText, pill);
+    }
+
+    // Tiles: same numbers as the Fishing tab, with time fished instead of "until reset".
+    const int attempts = r.catches + r.noItem;
+    struct TileInfo { const wchar_t* title; const wchar_t* sub; } tiles[4] = {
+        {L"CATCHES", L"item collected"}, {L"NO ITEM", L"failed / caught nothing"},
+        {L"SUCCESS RATE", L"collected / tries"}, {L"TIME FISHED", L"macro running"}};
+    for (int i = 0; i < 4; ++i) {
+        const float x = (i % 2) ? 196.0f : 18.0f;
+        const float y = (i / 2) ? 296.0f : 210.0f;
+        DrawCard(g, RectF(x, y, 166, 76));
+        Text(g, tiles[i].title, gFontLabel, ui::kText, RectF(x + 14, y + 10, 140, 16));
+        Text(g, tiles[i].sub, gFontSmall, ui::kMuted, RectF(x + 14, y + 25, 140, 14));
+        const RectF value(x + 12, y + 40, 140, 32);
+        if (i == 0) DrawCount(g, r.catches, value, gFontBig, ui::kText, Gdiplus::StringAlignmentNear);
+        else if (i == 1) DrawCount(g, r.noItem, value, gFontBig, r.noItem ? ui::kBad : ui::kText,
+                                   Gdiplus::StringAlignmentNear);
+        else if (i == 2) {
+            if (attempts > 0) swprintf_s(line, L"%d%%", r.catches * 100 / attempts);
+            else swprintf_s(line, L"—");
+            Text(g, line, gFontBig, ui::kText, value);
+        } else {
+            Text(g, FormatHoursMinutes(r.runningMs).c_str(), gFontBig, ui::kText, value);
+        }
+    }
+
+    Telemetry t;
+    t.oreCount = r.ore;
+    t.runningMs = static_cast<double>(r.runningMs);
+    for (int i = 0; i < 5; ++i) t.rarityCounts[i] = r.rarity[i];
+    DrawOreRarityCard(g, t, 384.0f, false);
+
+    InsetButton(g, RectF(18, 494, 120, 40), L"‹  Back", kHitSessBack, ui::kSoft, 12.0f);
+    const RectF del(150, 494, 212, 40);
+    if (r.id == gCurrentSessionId) {
+        FillInset(g, del, 12.0f);
+        TextCenter(g, L"Current session", gFontButton, ui::kMuted, del);
+    } else if (gSessionDeleteArmed) {
+        Gdiplus::SolidBrush red(Gdiplus::Color(255, 190, 60, 70));
+        FillRound(g, red, del, 12.0f);
+        HoverOverlay(g, del, 12.0f, kHitSessDelete);
+        TextCenter(g, L"Click again to delete", gFontButton, ui::kText, del);
+        AddHit(del, kHitSessDelete);
+    } else {
+        InsetButton(g, del, L"Delete session", kHitSessDelete, ui::kBad, 12.0f);
+    }
+}
+
+void DrawSessionsTab(Gdiplus::Graphics& g) {
+    if (const SessionRecord* open = FindSession(gSessionOpenId)) {
+        DrawSessionDetail(g, *open);
+        return;
+    }
+    gSessionOpenId = -1;
+    wchar_t line[128];
+    DrawCard(g, RectF(18, 128, 344, 54));
+    Text(g, L"FISH SESSIONS", gFontLabel, ui::kText, RectF(34, 136, 300, 16));
+    swprintf_s(line, L"%d saved · saved on exit and every minute", static_cast<int>(gSessions.size()));
+    Text(g, line, gFontSmall, ui::kMuted, RectF(34, 156, 310, 16));
+
+    const int count = static_cast<int>(gSessions.size());
+    if (count == 0) {
+        TextCenter(g, L"No sessions yet – start fishing!", gFontBody, ui::kMuted, RectF(18, 250, 344, 30));
+        return;
+    }
+    const int pages = (count + kSessionsPerPage - 1) / kSessionsPerPage;
+    gSessionPage = std::clamp(gSessionPage, 0, pages - 1);
+    for (int k = 0; k < kSessionsPerPage; ++k) {
+        const int index = count - 1 - (gSessionPage * kSessionsPerPage + k); // newest first
+        if (index < 0) break;
+        const SessionRecord& r = gSessions[index];
+        const float y = 192.0f + k * 50.0f;
+        const RectF row(18, y, 344, 44);
+        DrawCard(g, row, 12.0f);
+        HoverOverlay(g, row, 12.0f, kHitSessRow0 + k);
+        AddHit(row, kHitSessRow0 + k);
+        swprintf_s(line, L"#%d", r.id);
+        const RectF badge(28, y + 10, 44, 24);
+        if (r.id == gCurrentSessionId) FillGradient(g, badge, 12.0f);
+        else FillInset(g, badge, 12.0f);
+        TextCenter(g, line, gFontLabel, ui::kText, badge);
+        DrawCalendarIcon(g, 82, y + 8, ui::kMuted);
+        Text(g, FormatDate(r.start).c_str(), gFontSmall, ui::kSoft, RectF(98, y + 5, 88, 16));
+        DrawClockIcon(g, 82, y + 24, ui::kMuted);
+        swprintf_s(line, L"%ls – %ls", FormatClock(r.start).c_str(), FormatClock(r.end).c_str());
+        Text(g, line, gFontSmall, ui::kSoft, RectF(98, y + 22, 88, 16));
+        swprintf_s(line, L"%d catches", r.catches);
+        Text(g, line, gFontLabel, ui::kText, RectF(190, y + 5, 160, 16), Gdiplus::StringAlignmentFar);
+        swprintf_s(line, L"%d ORE · %ls", r.ore, FormatHoursMinutes(r.runningMs).c_str());
+        Text(g, line, gFontSmall, r.ore ? ui::kGradA : ui::kMuted, RectF(190, y + 22, 160, 16),
+             Gdiplus::StringAlignmentFar);
+    }
+    if (pages > 1) {
+        if (gSessionPage > 0) InsetButton(g, RectF(18, 548, 100, 32), L"‹ Newer", kHitSessPrev, ui::kSoft, 11.0f);
+        swprintf_s(line, L"%d / %d", gSessionPage + 1, pages);
+        TextCenter(g, line, gFontSmall, ui::kMuted, RectF(118, 548, 144, 32));
+        if (gSessionPage < pages - 1) InsetButton(g, RectF(262, 548, 100, 32), L"Older ›", kHitSessNext, ui::kSoft, 11.0f);
+    }
+}
+
 void PaintHud(HWND hwnd) {
     PAINTSTRUCT ps{};
     HDC windowDc = BeginPaint(hwnd, &ps);
@@ -2484,13 +2845,13 @@ void PaintHud(HWND hwnd) {
 
         // Segmented tab bar.
         DrawCard(g, RectF(18, 72, 344, 42));
-        const wchar_t* tabs[5] = {L"Fishing", L"Settings", L"Hotkeys", L"Setup", L"Auto Bait"};
-        for (int i = 0; i < 5; ++i) {
-            const RectF seg(22.0f + i * 67.2f, 76.0f, 67.2f, 34.0f);
+        const wchar_t* tabs[6] = {L"Fishing", L"Settings", L"Hotkeys", L"Setup", L"Bait", L"Sessions"};
+        for (int i = 0; i < 6; ++i) {
+            const RectF seg(22.0f + i * 56.0f, 76.0f, 56.0f, 34.0f);
             const int id = kHitTab0 + i;
             if (gActiveTab == i) FillGradient(g, seg, 11.0f);
             else HoverOverlay(g, seg, 11.0f, id);
-            TextCenter(g, tabs[i], gFontButton, gActiveTab == i ? ui::kText : ui::kMuted, seg);
+            TextCenter(g, tabs[i], gFontTab, gActiveTab == i ? ui::kText : ui::kMuted, seg);
             AddHit(seg, id);
         }
 
@@ -2498,7 +2859,9 @@ void PaintHud(HWND hwnd) {
         else if (gActiveTab == 1) DrawSettingsTab(g);
         else if (gActiveTab == 2) DrawHotkeysTab(g);
         else if (gActiveTab == 3) DrawSetupTab(g);
-        else DrawBaitTab(g);
+        else if (gActiveTab == 4) DrawBaitTab(g);
+        else DrawSessionsTab(g);
+        if (gActiveTab == 0 && gRestorePromptId >= 0) DrawRestorePrompt(g);
     }
 
     BitBlt(windowDc, 0, 0, client.right, client.bottom, dc, 0, 0, SRCCOPY);
@@ -2517,11 +2880,12 @@ void CreateUiFonts() {
     gFontLabel = new Gdiplus::Font(L"Segoe UI", 11.0f, Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
     gFontBody = new Gdiplus::Font(L"Segoe UI", 13.0f, Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
     gFontSmall = new Gdiplus::Font(L"Segoe UI", 11.0f, Gdiplus::FontStyleRegular, Gdiplus::UnitPixel);
+    gFontTab = new Gdiplus::Font(L"Segoe UI", 11.5f, Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
 }
 
 void DestroyUiFonts() {
     for (Gdiplus::Font** f : {&gFontTitle, &gFontHead, &gFontBig, &gFontRow, &gFontButton,
-                              &gFontLabel, &gFontBody, &gFontSmall}) {
+                              &gFontLabel, &gFontBody, &gFontSmall, &gFontTab}) {
         delete *f;
         *f = nullptr;
     }
@@ -2549,6 +2913,10 @@ void ToggleTracker() {
     }
     gEnabled.store(!gEnabled.load());
     if (!gEnabled.load()) MouseButton(false);
+    if (gEnabled.load()) {
+        gRestorePromptId = -1;
+        if (gCurrentSessionStart == 0) gCurrentSessionStart = static_cast<long long>(time(nullptr));
+    }
     UpdateButtonLabel();
     InvalidateRect(gWindow, nullptr, FALSE);
 }
@@ -2997,7 +3365,9 @@ void UpdateRespawnEverySetting() {
 
 void HandleHit(HWND hwnd, int id) {
     switch (id) {
-        case kHitTab0: case kHitTab1: case kHitTab2: case kHitTab3: case kHitTab4:
+        case kHitTab0: case kHitTab1: case kHitTab2: case kHitTab3: case kHitTab4: case kHitTab5:
+            gSessionDeleteArmed = false;
+            if (id == kHitTab5 && gActiveTab == 5) gSessionOpenId = -1; // tab click again = back to list
             SetActiveTab(id - kHitTab0);
             break;
         case kHitStart:
@@ -3045,6 +3415,40 @@ void HandleHit(HWND hwnd, int id) {
         case kHitCalBar:
             if (gCalibrating.load() && gCalibrationTarget == CalibrationTarget::BarRegion) EndCalibration();
             else StartCalibration(CalibrationTarget::BarRegion);
+            break;
+        case kHitSessRow0: case kHitSessRow0 + 1: case kHitSessRow0 + 2: case kHitSessRow0 + 3:
+        case kHitSessRow0 + 4: case kHitSessRow0 + 5: case kHitSessRow0 + 6: {
+            const int index = static_cast<int>(gSessions.size()) - 1 -
+                (gSessionPage * kSessionsPerPage + (id - kHitSessRow0));
+            if (index >= 0 && index < static_cast<int>(gSessions.size())) gSessionOpenId = gSessions[index].id;
+            gSessionDeleteArmed = false;
+            break;
+        }
+        case kHitSessPrev:
+            --gSessionPage;
+            break;
+        case kHitSessNext:
+            ++gSessionPage;
+            break;
+        case kHitSessBack:
+            gSessionOpenId = -1;
+            gSessionDeleteArmed = false;
+            break;
+        case kHitSessDelete:
+            if (!gSessionDeleteArmed) {
+                gSessionDeleteArmed = true;
+            } else {
+                DeleteSession(gSessionOpenId);
+                gSessionOpenId = -1;
+                gSessionDeleteArmed = false;
+            }
+            break;
+        case kHitRestoreYes:
+            ContinueSession(gRestorePromptId);
+            gRestorePromptId = -1;
+            break;
+        case kHitRestoreNo:
+            gRestorePromptId = -1;
             break;
         case kHitBaitStart:
             if (gBaitRunning.load()) StopBaitBuying();
@@ -3246,7 +3650,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             }
             return result;
         }
+        case WM_TIMER:
+            if (wParam == 1) SaveCurrentSession(); // autosave every minute
+            return 0;
+        case WM_ENDSESSION:
+            if (wParam) SaveCurrentSession();      // Windows shutting down / logging off
+            return 0;
         case WM_CLOSE:
+            SaveCurrentSession();
             StopBaitBuying();
             gEnabled.store(false);
             gQuit.store(true);
@@ -3311,6 +3722,14 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     }
 
     SetActiveTab(0);
+
+    // Sessions: next number after the saved ones, and offer the last one.
+    LoadSessions();
+    if (!gSessions.empty()) {
+        gCurrentSessionId = gSessions.back().id + 1;
+        gRestorePromptId = gSessions.back().id;
+    }
+    SetTimer(gWindow, 1, 60000, nullptr);
 
     // Default the cast point to screen center until the user calibrates it -
     // but don't clobber one already loaded from settings above.

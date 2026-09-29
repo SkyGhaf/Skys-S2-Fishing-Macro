@@ -35,6 +35,11 @@ on your own screen, so it runs at any resolution.
   long it will take (while buying: the time left, based on the measured pace).
   It has its own global start/stop hotkey (default F3, changeable in the Hotkeys tab). Fishing
   pauses while it is buying.
+- **Fish sessions (Sessions tab):** every session is saved as one line of numbers (on exit and
+  every minute, so a crash loses nothing). There is a numbered list with date and time, and opening
+  one shows its catches, no item, success rate, time fished, ORE (+ ORE per hour) and rarity drops.
+  Sessions can be deleted. On startup the macro offers to continue the last session.
+- **ORE per hour** is shown next to the ORE counter, based on the time actually spent fishing.
 - **Equip on start:** every time you press Start it quickly taps the *correction key* (default
   `1`) and then the *rod key* (default `5`). You can change both in the **Hotkeys** tab.
 - **Collect delay / Hold T time:** choose how long to wait after the minigame before holding **T**,
