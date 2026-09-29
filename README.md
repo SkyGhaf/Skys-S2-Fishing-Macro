@@ -21,7 +21,8 @@ on your own screen, so it runs at any resolution.
   shows catches, no-item count and the success rate. Calibrate the **Collect message** box in the
   Setup tab. Without it, every collect counts as a catch.
 - **Rarity counter:** each collected item is sorted by the colour of its message banner:
-  **Mythic** (red), **Legendary** (gold), **Rare** (blue) or **Common** (grey). The counts show
+  **Impossible** (black, e.g. Lost Shotgun), **Mythic** (red), **Legendary** (gold), **Rare** (blue)
+  or **Common** (grey). The counts show
   on the Fishing tab.
 - **ORE counter:** Ore is a Mythic with a very short name. A Mythic whose name is at most ~46 px
   wide at 1440p (scaled for other resolutions) counts as **ORE**. "Ore" is 36 px; the shortest

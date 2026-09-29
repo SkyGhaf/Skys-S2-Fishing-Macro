@@ -154,7 +154,7 @@ struct Telemetry {
     int collectAttempt = 0;       // 0-based try of the current collect
     int lastCollectDetected = -1; // -1 no check yet, 0 not found, 1 detected
     bool collectCheckReady = false;
-    int rarityCounts[4] = {}; // indexed by Rarity (kRarityCount)
+    int rarityCounts[5] = {}; // indexed by Rarity (kRarityCount)
     int lastRarity = -1;
     int oreCount = 0;
     bool lastWasOre = false;
@@ -905,19 +905,24 @@ int CollectMessageScore(const CaptureSurface& surface, const std::vector<uint32_
 // a = 0.30 and the true line colours below were fitted on 69 labelled real
 // collects (69/69 correct, also leave-one-out). A fixed deck/water split
 // failed on a darker deck, which read as "water" and turned Rares into Mythic.
-enum Rarity { kRarityMythic = 0, kRarityLegendary, kRarityRare, kRarityCommon, kRarityCount };
-const wchar_t* const kRarityNames[kRarityCount] = {L"Mythic", L"Legendary", L"Rare", L"Common"};
+// IMPOSSIBLE (the rarest, e.g. Lost Shotgun) has a black line: measured
+// (-2,-2,-5) after un-blending on the first one caught, 2026-09-29 09:32:39.
+enum Rarity { kRarityImpossible = 0, kRarityMythic, kRarityLegendary, kRarityRare, kRarityCommon,
+              kRarityCount };
+const wchar_t* const kRarityNames[kRarityCount] = {L"Impossible", L"Mythic", L"Legendary", L"Rare", L"Common"};
 
 constexpr double kBannerAlpha = 0.30;
 const int kRarityLineColour[kRarityCount][3] = {
+    {0, 0, 0},       // Impossible: black
     {115, -4, 2},    // Mythic: red
     {192, 152, 38},  // Legendary: gold
     {48, 137, 185},  // Rare: blue
     {160, 164, 145}, // Common: grey
 };
-// A real banner line scores 20+; glare without a banner (e.g. the character's
-// lantern light) scores ~0.
-constexpr double kMinBannerLineScore = 8.0;
+// Real item banners score 18+ (median ~55 over 2746 captures). Things that
+// are not item messages score lower: the character's lantern glare ~0 and
+// the "Wall - Stop Climbing" prompt 11.7-12.6 (it was counted as Mythic/ORE).
+constexpr double kMinBannerLineScore = 15.0;
 
 // Median colour of one row, skipping the left quarter (item icon) and the
 // white text. False if too few pixels remain.
@@ -2098,48 +2103,55 @@ void DrawFishingTab(Gdiplus::Graphics& g, const Telemetry& t) {
     if (respawnOn) FillGradient(g, RectF(342, 338, 4, 44), 2.0f, true);
 
     // --- Rarity card ---------------------------------------------------------------
-    DrawCard(g, RectF(18, 410, 344, 92));
-    Text(g, L"ORE & RARITY", gFontLabel, ui::kText, RectF(34, 420, 180, 16));
+    DrawCard(g, RectF(18, 410, 344, 96));
+    Text(g, L"ORE & RARITY", gFontLabel, ui::kText, RectF(34, 416, 180, 16));
     if (!t.collectCheckReady) {
-        Text(g, L"item check off", gFontSmall, ui::kWarn, RectF(200, 420, 146, 16),
+        Text(g, L"item check off", gFontSmall, ui::kWarn, RectF(200, 416, 146, 16),
              Gdiplus::StringAlignmentFar);
     } else if (t.lastCollectDetected == 0) {
-        Text(g, L"last: no item", gFontSmall, ui::kBad, RectF(200, 420, 146, 16),
+        Text(g, L"last: no item", gFontSmall, ui::kBad, RectF(200, 416, 146, 16),
              Gdiplus::StringAlignmentFar);
     } else if (t.lastRarity >= 0) {
-        swprintf_s(line, L"last: %s \u2713", t.lastWasOre ? L"ORE" : kRarityNames[t.lastRarity]);
-        Text(g, line, gFontSmall, ui::kSoft, RectF(200, 420, 146, 16), Gdiplus::StringAlignmentFar);
+        swprintf_s(line, L"last: %s ✓", t.lastWasOre ? L"ORE" : kRarityNames[t.lastRarity]);
+        Text(g, line, gFontSmall, ui::kSoft, RectF(200, 416, 146, 16), Gdiplus::StringAlignmentFar);
     }
     {
         // ORE block (left): the item everyone fishes for.
-        const RectF oreBox(34, 442, 96, 52);
+        const RectF oreBox(34, 436, 96, 64);
         if (t.oreCount > 0 || (t.lastWasOre && t.lastCollectDetected == 1)) FillGradient(g, oreBox, 12.0f);
         else FillInset(g, oreBox, 12.0f);
-        Text(g, L"ORE", gFontLabel, ui::kText, RectF(44, 446, 80, 16));
+        Text(g, L"ORE", gFontLabel, ui::kText, RectF(44, 442, 80, 16));
         swprintf_s(line, L"%d", t.oreCount);
         Text(g, line, gFontBig, ui::kText, RectF(42, 460, 84, 32));
     }
     {
         const Gdiplus::Color dots[kRarityCount] = {
-            Gdiplus::Color(255, 248, 82, 82), Gdiplus::Color(255, 250, 190, 50),
-            Gdiplus::Color(255, 70, 150, 255), Gdiplus::Color(255, 165, 168, 185)};
+            Gdiplus::Color(255, 20, 20, 26), Gdiplus::Color(255, 248, 82, 82),
+            Gdiplus::Color(255, 250, 190, 50), Gdiplus::Color(255, 70, 150, 255),
+            Gdiplus::Color(255, 165, 168, 185)};
         for (int i = 0; i < kRarityCount; ++i) {
-            const float cx = 138.0f + (i % 2) * 106.0f;
-            const float cy = 442.0f + (i / 2) * 28.0f;
-            const RectF chip(cx, cy, 102.0f, 24.0f);
-            FillInset(g, chip, 12.0f);
+            // Impossible gets the full top row, the others a 2x2 grid below it.
+            const bool top = i == kRarityImpossible;
+            const float cx = top ? 138.0f : 138.0f + ((i - 1) % 2) * 106.0f;
+            const float cy = top ? 436.0f : 458.0f + ((i - 1) / 2) * 22.0f;
+            const RectF chip(cx, cy, top ? 208.0f : 102.0f, 20.0f);
+            FillInset(g, chip, 10.0f);
             if (t.lastRarity == i && t.lastCollectDetected == 1) {
-                Gdiplus::Pen ring(dots[i], 1.5f);
+                Gdiplus::Pen ring(top ? ui::kText : dots[i], 1.5f);
                 Gdiplus::GraphicsPath path;
-                AddRoundRect(path, chip, 12.0f);
+                AddRoundRect(path, chip, 10.0f);
                 g.DrawPath(&ring, &path);
             }
             Gdiplus::SolidBrush dot(dots[i]);
-            g.FillEllipse(&dot, RectF(cx + 9.0f, cy + 8.0f, 8.0f, 8.0f));
+            g.FillEllipse(&dot, RectF(cx + 9.0f, cy + 6.0f, 8.0f, 8.0f));
+            if (top) {
+                Gdiplus::Pen outline(ui::kMuted, 1.0f); // black dot needs an outline on the dark chip
+                g.DrawEllipse(&outline, RectF(cx + 9.0f, cy + 6.0f, 8.0f, 8.0f));
+            }
             Text(g, kRarityNames[i], gFontSmall, t.collectCheckReady ? ui::kSoft : ui::kMuted,
-                 RectF(cx + 20.0f, cy, 58.0f, 24.0f));
+                 RectF(cx + 22.0f, cy, 80.0f, 20.0f));
             swprintf_s(line, L"%d", t.rarityCounts[i]);
-            Text(g, line, gFontLabel, ui::kText, RectF(cx + 72.0f, cy, 24.0f, 24.0f),
+            Text(g, line, gFontLabel, ui::kText, RectF(cx + chip.Width - 34.0f, cy, 26.0f, 20.0f),
                  Gdiplus::StringAlignmentFar);
         }
     }
