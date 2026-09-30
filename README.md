@@ -15,6 +15,12 @@ on your own screen, so it runs at any resolution.
   white block, using short holds and releases to keep the block in the zone.
 - **Auto reposition (set respawn):** resets your character (Esc → R → Enter) every *N* catches
   (default 10), and after 2 missed casts in a row, so you stay on the same spot.
+- **Walk back (auto reposition without the reset gamepass):** set *Auto reposition* to **Walk**,
+  then on the Setup tab box a **position anchor** (a still part of the world, such as crates or the
+  pier, not water or your character). The macro learns how far one W/A/S/D tap moves the view.
+  After every catch it finds the anchor again (ZNCC on edges, so it isn't affected by day/night or
+  shadows), works out the drift and walks it off with W/A/S/D. If it can't, the Fishing tab shows
+  **LOST POSITION** and it tries again after the next catch.
 - **Item check:** after holding **T** the macro looks for the game's item message (for example
   "Clown Fish x1", in any colour or icon). Without a message it holds T again, up to 2 more times.
   Only a seen message counts as a catch; otherwise it counts as *no item* (the pickup failed, or the game gave nothing - the two look the same on screen). The Fishing tab

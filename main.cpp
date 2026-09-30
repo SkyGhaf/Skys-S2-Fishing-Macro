@@ -77,7 +77,7 @@ enum class ControlState { Waiting, Holding, Releasing, Floating, Paused };
 //   Hook    -> existing bar-catching control, until the exit bar disappears
 //   Collect -> a fixed pause after hooking ends
 //   HoldKey -> holds the T key to collect/confirm, then loops back to Cast
-enum class Phase { Cast, Hook, Collect, HoldKey, VerifyCollect, WaitForFish, Respawn };
+enum class Phase { Cast, Hook, Collect, HoldKey, VerifyCollect, WaitForFish, Respawn, Reposition };
 
 // Pause between the minigame ending and holding T to collect (user setting).
 constexpr ULONGLONG kDefaultCollectDelayMs = 4000;
@@ -164,6 +164,9 @@ struct Telemetry {
     int oreCount = 0;
     bool lastWasOre = false;
     double runningMs = 0.0; // time actually spent fishing this session (not paused)
+    bool positionLost = false;   // walk back couldn't find the anchor spot again
+    int positionOffset = -1;     // px from the anchor spot at the last check (-1 = not checked)
+    bool learningWalk = false;   // learning the W/A/S/D steps right now
     int confidence = 0;
     ControlState state = ControlState::Paused;
     Phase phase = Phase::Cast;
@@ -173,6 +176,10 @@ std::atomic<bool> gQuit{false};
 std::atomic<bool> gEnabled{false};
 std::atomic<ULONGLONG> gWaitForFishMs{kDefaultWaitForFishMs};
 std::atomic<bool> gAutoRespawn{false};
+// Auto reposition mode: 0 = off, 1 = reset character (gamepass), 2 = walk
+// back to the position anchor with W/A/S/D. gAutoRespawn mirrors mode 1.
+std::atomic<int> gRepositionMode{0};
+std::atomic<bool> gLearnWalkRequested{false}; // UI -> tracker: learn the W/A/S/D steps
 // Setup tab toggle: write one CSV per minigame into logs\ for tuning.
 std::atomic<bool> gMinigameLog{false};
 std::atomic<ULONGLONG> gCollectDelayMs{kDefaultCollectDelayMs};
@@ -226,7 +233,7 @@ HBRUSH gBackgroundBrush = nullptr;
 int gActiveTab = 0; // 0 = Fishing, 1 = Settings, 2 = Hotkeys, 3 = Setup
 
 // Which calibration is currently in progress, if any.
-enum class CalibrationTarget { None, CastPoint, BarRegion, ExitRegion, CollectRegion, BaitPoint };
+enum class CalibrationTarget { None, CastPoint, BarRegion, ExitRegion, CollectRegion, BaitPoint, AnchorRegion };
 CalibrationTarget gCalibrationTarget = CalibrationTarget::None; // UI thread only
 POINT gDragStart{};   // first corner of a region drag, set by the mouse hook
 bool gDragging = false; // UI thread only; true between mousedown and mouseup
@@ -421,6 +428,7 @@ const wchar_t* PhaseText(Phase phase) {
         case Phase::VerifyCollect: return L"CHECKING ITEM";
         case Phase::WaitForFish: return L"WAIT FOR FISH";
         case Phase::Respawn: return L"RESPAWNING";
+        case Phase::Reposition: return L"WALKING BACK";
     }
     return L"UNKNOWN";
 }
@@ -1441,6 +1449,348 @@ DWORD WINAPI DiscordThread(void*) {
     return 0;
 }
 
+// ---------------------------------------------------------------------------
+// Walk back (auto reposition without the reset gamepass).
+// The camera follows the character, so drift shows up as the whole scene
+// shifting on screen. A "position anchor" (a static patch of the world,
+// calibrated by the user) is found again with ZNCC on Sobel edges - edges
+// don't change with day/night or shadows and ZNCC ignores brightness and
+// contrast - and the measured shift is walked off with W/A/S/D using
+// per-tap steps learned right after calibrating.
+// ---------------------------------------------------------------------------
+constexpr int kAnchorSearch = 48;          // px searched around the anchor spot
+// Below this the anchor counts as not found. Measured: real matches 0.85-1.00
+// (shifts, +-25% light, +-5% zoom), 5 deg rotated view 0.50, blocked 0.16.
+constexpr double kAnchorMinScore = 0.6;
+constexpr int kWalkTapMs = 90;             // one step = a 90 ms key tap
+constexpr int kWalkOkPx = 4;               // close enough
+
+struct WalkStep { float x = 0, y = 0; };   // scene shift in px per tap
+std::mutex gAnchorMutex;
+RECT gAnchorRect{0, 0, 0, 0};
+std::vector<float> gAnchorEdges;           // edges of the anchor window at calibration
+int gAnchorWinW = 0, gAnchorWinH = 0;      // anchor rect + kAnchorSearch on every side
+WalkStep gWalkSteps[4];                    // W, A, S, D
+bool gWalkLearned = false;
+const WORD kWalkKeys[4] = {'W', 'A', 'S', 'D'};
+
+RECT GetAnchorRect() {
+    std::lock_guard<std::mutex> lock(gAnchorMutex);
+    return gAnchorRect;
+}
+
+bool AnchorReady() {
+    std::lock_guard<std::mutex> lock(gAnchorMutex);
+    return !gAnchorEdges.empty();
+}
+
+bool WalkLearned() {
+    std::lock_guard<std::mutex> lock(gAnchorMutex);
+    return gWalkLearned && !gAnchorEdges.empty();
+}
+
+std::wstring AnchorImagePath() {
+    wchar_t modulePath[MAX_PATH];
+    const DWORD len = GetModuleFileNameW(nullptr, modulePath, MAX_PATH);
+    std::wstring dir(modulePath, (len > 0 && len < MAX_PATH) ? len : 0);
+    return dir.substr(0, dir.find_last_of(L"\\/") + 1) + L"SkysS2FishingMacro_anchor.bmp";
+}
+
+bool LoadBmp32(const std::wstring& path, std::vector<uint32_t>& pixels, int& w, int& h) {
+    FILE* f = _wfopen(path.c_str(), L"rb");
+    if (!f) return false;
+    BITMAPFILEHEADER bf{};
+    BITMAPINFOHEADER bi{};
+    const bool ok = fread(&bf, sizeof(bf), 1, f) == 1 && fread(&bi, sizeof(bi), 1, f) == 1 &&
+                    bf.bfType == 0x4D42 && bi.biBitCount == 32 && bi.biHeight < 0;
+    if (ok) {
+        w = bi.biWidth;
+        h = -bi.biHeight;
+        pixels.resize(static_cast<size_t>(w) * h);
+        fseek(f, bf.bfOffBits, SEEK_SET);
+        if (fread(pixels.data(), 4, pixels.size(), f) != pixels.size()) pixels.clear();
+    }
+    fclose(f);
+    return ok && !pixels.empty();
+}
+
+// Sobel gradient magnitude of the grayscale image.
+void EdgeMap(const uint32_t* px, int w, int h, std::vector<float>& out) {
+    std::vector<float> g(static_cast<size_t>(w) * h);
+    for (size_t i = 0; i < g.size(); ++i) g[i] = static_cast<float>(Luma(px[i]));
+    out.assign(g.size(), 0.0f);
+    for (int y = 1; y < h - 1; ++y) {
+        for (int x = 1; x < w - 1; ++x) {
+            const float* a = &g[(y - 1) * w + x];
+            const float* b = &g[y * w + x];
+            const float* c = &g[(y + 1) * w + x];
+            const float gx = (a[1] + 2 * b[1] + c[1]) - (a[-1] + 2 * b[-1] + c[-1]);
+            const float gy = (c[-1] + 2 * c[0] + c[1]) - (a[-1] + 2 * a[0] + a[1]);
+            out[y * w + x] = std::fabs(gx) + std::fabs(gy);
+        }
+    }
+    // Soften the edges (two 3x3 box passes): a slightly zoomed view after
+    // drifting forward/back then still overlaps (sharp 1 px edges didn't at
+    // +3% scale), and the coarse 4 px search step can't skip the peak.
+    std::vector<float> tmp(out.size());
+    for (int pass = 0; pass < 2; ++pass) {
+        for (int y = 1; y < h - 1; ++y) {
+            for (int x = 1; x < w - 1; ++x) {
+                float sum = 0;
+                for (int dy = -1; dy <= 1; ++dy) {
+                    const float* row = &out[(y + dy) * w + x];
+                    sum += row[-1] + row[0] + row[1];
+                }
+                tmp[y * w + x] = sum / 9.0f;
+            }
+        }
+        out.swap(tmp);
+    }
+}
+
+// Zero-mean normalized cross-correlation of the anchor (the centre of the
+// reference window) against the current window shifted by (ox, oy),
+// sampling every `step` pixels. -1..1, 1 = identical up to brightness/contrast.
+double Zncc(const std::vector<float>& ref, const std::vector<float>& cur, int winW, int winH,
+            int ox, int oy, int step) {
+    const int tw = winW - 2 * kAnchorSearch, th = winH - 2 * kAnchorSearch;
+    double st = 0, sv = 0, stt = 0, svv = 0, stv = 0;
+    int n = 0;
+    for (int y = 1; y < th - 1; y += step) {
+        const float* t = &ref[(kAnchorSearch + y) * winW + kAnchorSearch];
+        const float* v = &cur[(oy + y) * winW + ox];
+        for (int x = 1; x < tw - 1; x += step) {
+            st += t[x];
+            sv += v[x];
+            stt += t[x] * t[x];
+            svv += v[x] * v[x];
+            stv += t[x] * v[x];
+            ++n;
+        }
+    }
+    const double varT = n * stt - st * st, varV = n * svv - sv * sv;
+    if (n == 0 || varT <= 1e-6 || varV <= 1e-6) return -1.0;
+    return (n * stv - st * sv) / std::sqrt(varT * varV);
+}
+
+struct AnchorMatch {
+    bool valid = false;
+    int dx = 0, dy = 0;   // scene shift since calibration, in px
+    double score = -1.0;
+};
+
+// Captures the anchor window now and finds the anchor in it: coarse (every
+// 4 px, half the samples) over +-48 px, then +-3 px at full detail.
+AnchorMatch MeasureAnchor() {
+    AnchorMatch m;
+    std::vector<float> ref;
+    RECT r;
+    int winW, winH;
+    {
+        std::lock_guard<std::mutex> lock(gAnchorMutex);
+        if (gAnchorEdges.empty()) return m;
+        ref = gAnchorEdges;
+        r = gAnchorRect;
+        winW = gAnchorWinW;
+        winH = gAnchorWinH;
+    }
+    CaptureSurface surface;
+    if (!surface.Create(winW, winH) || !surface.Grab(r.left - kAnchorSearch, r.top - kAnchorSearch)) return m;
+    std::vector<float> cur;
+    EdgeMap(surface.pixels, winW, winH, cur);
+    int bestX = kAnchorSearch, bestY = kAnchorSearch;
+    double best = -2.0;
+    for (int oy = 0; oy <= 2 * kAnchorSearch; oy += 4) {
+        for (int ox = 0; ox <= 2 * kAnchorSearch; ox += 4) {
+            const double z = Zncc(ref, cur, winW, winH, ox, oy, 2);
+            if (z > best) { best = z; bestX = ox; bestY = oy; }
+        }
+    }
+    const int cx = bestX, cy = bestY;
+    best = -2.0;
+    for (int oy = std::max(0, cy - 3); oy <= std::min(2 * kAnchorSearch, cy + 3); ++oy) {
+        for (int ox = std::max(0, cx - 3); ox <= std::min(2 * kAnchorSearch, cx + 3); ++ox) {
+            const double z = Zncc(ref, cur, winW, winH, ox, oy, 1);
+            if (z > best) { best = z; bestX = ox; bestY = oy; }
+        }
+    }
+    m.valid = true;
+    m.dx = bestX - kAnchorSearch;
+    m.dy = bestY - kAnchorSearch;
+    m.score = best;
+    return m;
+}
+
+// Waits until the anchor window stops changing (animations, camera settling,
+// render lag after a key tap): unchanged for `stableMs`, at most `maxMs`.
+void WaitStableAnchor(int stableMs, int maxMs) {
+    RECT r;
+    int winW, winH;
+    {
+        std::lock_guard<std::mutex> lock(gAnchorMutex);
+        r = gAnchorRect;
+        winW = gAnchorWinW;
+        winH = gAnchorWinH;
+    }
+    CaptureSurface surface;
+    if (winW <= 0 || !surface.Create(winW, winH)) return;
+    uint64_t last = 0;
+    const ULONGLONG start = GetTickCount64();
+    ULONGLONG sameSince = start;
+    while (!gQuit.load() && GetTickCount64() - start < static_cast<ULONGLONG>(maxMs)) {
+        if (surface.Grab(r.left - kAnchorSearch, r.top - kAnchorSearch)) {
+            const uint64_t sig = FrameSignature(surface);
+            if (sig != last) {
+                last = sig;
+                sameSince = GetTickCount64();
+            } else if (GetTickCount64() - sameSince >= static_cast<ULONGLONG>(stableMs)) {
+                return;
+            }
+        }
+        Sleep(15);
+    }
+}
+
+void TapWalkKey(int key, int count) {
+    for (int i = 0; i < count && !gQuit.load(); ++i) {
+        KeyEvent(true, kWalkKeys[key]);
+        Sleep(kWalkTapMs);
+        KeyEvent(false, kWalkKeys[key]);
+        Sleep(60);
+    }
+}
+
+// UI thread, right after the anchor box was dragged: store the reference.
+bool CaptureAnchorReference(const RECT& r) {
+    const int winW = (r.right - r.left) + 2 * kAnchorSearch, winH = (r.bottom - r.top) + 2 * kAnchorSearch;
+    CaptureSurface surface;
+    if (!surface.Create(winW, winH) || !surface.Grab(r.left - kAnchorSearch, r.top - kAnchorSearch)) return false;
+    std::vector<float> edges;
+    EdgeMap(surface.pixels, winW, winH, edges);
+    SaveBmp(AnchorImagePath(), surface.pixels, winW, winH);
+    std::lock_guard<std::mutex> lock(gAnchorMutex);
+    gAnchorRect = r;
+    gAnchorEdges = std::move(edges);
+    gAnchorWinW = winW;
+    gAnchorWinH = winH;
+    gWalkLearned = false;
+    return true;
+}
+
+// Startup: load the saved reference image (the rect comes from the ini).
+void LoadAnchorReference(const RECT& r) {
+    std::vector<uint32_t> pixels;
+    int w = 0, h = 0;
+    if (!RectCalibrated(r) || !LoadBmp32(AnchorImagePath(), pixels, w, h)) return;
+    if (w != (r.right - r.left) + 2 * kAnchorSearch || h != (r.bottom - r.top) + 2 * kAnchorSearch) return;
+    std::vector<float> edges;
+    EdgeMap(pixels.data(), w, h, edges);
+    std::lock_guard<std::mutex> lock(gAnchorMutex);
+    gAnchorRect = r;
+    gAnchorEdges = std::move(edges);
+    gAnchorWinW = w;
+    gAnchorWinH = h;
+}
+
+// Learns how far one tap of W, A, S and D shifts the scene: 3 taps per key,
+// waiting for a still frame after each, then walking the same taps back.
+bool LearnWalkSteps() {
+    if (!AnchorReady() || !FocusGame()) return false;
+    WaitStableAnchor(300, 1500);
+    WalkStep learned[4];
+    for (int key = 0; key < 4; ++key) {
+        AnchorMatch before = MeasureAnchor();
+        if (!before.valid || before.score < kAnchorMinScore) return false;
+        float sx = 0, sy = 0;
+        for (int i = 0; i < 3; ++i) {
+            TapWalkKey(key, 1);
+            WaitStableAnchor(150, 600);
+            const AnchorMatch after = MeasureAnchor();
+            if (!after.valid || after.score < kAnchorMinScore) return false;
+            sx += static_cast<float>(after.dx - before.dx);
+            sy += static_cast<float>(after.dy - before.dy);
+            before = after;
+        }
+        learned[key].x = sx / 3.0f;
+        learned[key].y = sy / 3.0f;
+        TapWalkKey((key + 2) % 4, 3); // W<->S, A<->D: walk back
+        WaitStableAnchor(150, 600);
+    }
+    std::lock_guard<std::mutex> lock(gAnchorMutex);
+    for (int k = 0; k < 4; ++k) gWalkSteps[k] = learned[k];
+    gWalkLearned = true;
+    return true;
+}
+
+struct WalkResult {
+    bool lost = false;
+    int offset = 0;        // px from the anchor spot at the end
+    int taps = 0;
+};
+
+// Walks the drift off. The needed scene shift (-offset) is split over one
+// forward/back and one left/right key by solving a 2x2 system with the
+// learned steps (tries all four key pairs, keeps the one with positive
+// amounts), taps 80% of it (inertia), lets it settle and measures again.
+WalkResult WalkBackToAnchor() {
+    WalkResult result;
+    WalkStep steps[4];
+    {
+        std::lock_guard<std::mutex> lock(gAnchorMutex);
+        for (int k = 0; k < 4; ++k) steps[k] = gWalkSteps[k];
+    }
+    WaitStableAnchor(300, 1500);       // let the catch/rod animation finish
+    const ULONGLONG start = GetTickCount64();
+    int noProgress = 0;
+    double bestDist = 1e9;
+    for (int round = 0; round < 10; ++round) {
+        const AnchorMatch m = MeasureAnchor();
+        if (!m.valid || m.score < kAnchorMinScore) {
+            result.lost = true;
+            result.offset = m.valid ? static_cast<int>(std::lround(std::hypot(m.dx, m.dy))) : -1;
+            return result;
+        }
+        const double dist = std::hypot(m.dx, m.dy);
+        result.offset = static_cast<int>(std::lround(dist));
+        if (dist <= kWalkOkPx) return result;
+        if (dist >= bestDist * 0.95) {
+            if (++noProgress >= 2) { result.lost = true; return result; }
+        } else {
+            noProgress = 0;
+            bestDist = dist;
+        }
+        if (result.taps >= 30 || GetTickCount64() - start > 8000) { result.lost = true; return result; }
+        if (!FocusGame()) return result; // not in front: try again after the next catch
+
+        const double tx = -m.dx, ty = -m.dy;
+        int bestKey1 = -1, bestKey2 = -1;
+        double bestA = 0, bestB = 0;
+        for (int fwd : {0, 2}) {           // W or S
+            for (int side : {1, 3}) {      // A or D
+                const double det = steps[fwd].x * steps[side].y - steps[fwd].y * steps[side].x;
+                if (std::fabs(det) < 1e-3) continue;
+                const double a = (tx * steps[side].y - ty * steps[side].x) / det;
+                const double b = (steps[fwd].x * ty - steps[fwd].y * tx) / det;
+                if (a >= -0.25 && b >= -0.25 && (bestKey1 < 0 || a + b < bestA + bestB)) {
+                    bestKey1 = fwd; bestKey2 = side; bestA = std::max(0.0, a); bestB = std::max(0.0, b);
+                }
+            }
+        }
+        if (bestKey1 < 0) { result.lost = true; return result; }
+        int tapsA = std::min(5, static_cast<int>(std::lround(0.8 * bestA)));
+        int tapsB = std::min(5, static_cast<int>(std::lround(0.8 * bestB)));
+        if (tapsA == 0 && tapsB == 0) {    // less than one step: do the bigger one once
+            if (bestA >= bestB) tapsA = 1; else tapsB = 1;
+        }
+        TapWalkKey(bestKey1, tapsA);
+        TapWalkKey(bestKey2, tapsB);
+        result.taps += tapsA + tapsB;
+        WaitStableAnchor(150, 600);
+    }
+    result.lost = true;
+    return result;
+}
+
 DWORD WINAPI TrackerThread(void*) {
     timeBeginPeriod(1);
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
@@ -1526,6 +1876,10 @@ DWORD WINAPI TrackerThread(void*) {
     int failStreak = 0;
     double runningAtLastCatch = 0.0;
     bool failAlertSent = false;
+    // Walk back
+    bool positionLost = false;
+    int positionOffset = -1;
+    int lostStreak = 0;
     int attemptRarity = kRarityCommon; // best classification during this attempt
     int attemptBestScore = -1;
     std::vector<uint32_t> attemptRarityFrame; // clearest frame of the message (rarity is read from it)
@@ -1673,9 +2027,29 @@ DWORD WINAPI TrackerThread(void*) {
             }
         }
 
+        // Learn the W/A/S/D steps (asked by the Setup tab, only while paused).
+        if (gLearnWalkRequested.exchange(false) && !gEnabled.load()) {
+            {
+                Telemetry busy;
+                {
+                    std::lock_guard<std::mutex> lock(gTelemetryMutex);
+                    busy = gTelemetry;
+                }
+                busy.learningWalk = true;
+                std::lock_guard<std::mutex> lock(gTelemetryMutex);
+                gTelemetry = busy;
+            }
+            PostMessage(gWindow, WM_TRACKER_UPDATE, 0, 0);
+            LearnWalkSteps();
+            gLearnWalkRequested.store(false);
+            PostMessage(gWindow, WM_CALIBRATION_DONE + 100, 0, 0); // save the steps (UI thread)
+        }
+
         Telemetry current{};
         current.enabled = gEnabled.load();
         current.runningMs = runningMs;
+        current.positionLost = positionLost;
+        current.positionOffset = positionOffset;
         current.fps = fpsAverage;
         current.captureReady = captureReady;
         current.totalCatches = totalCatches;
@@ -2131,7 +2505,7 @@ DWORD WINAPI TrackerThread(void*) {
                 }
                 if (checking) lastCollectDetected = outcome;
                 ++catchesSinceRespawn;
-                phase = Phase::Cast;
+                phase = (gRepositionMode.load() == 2 && WalkLearned()) ? Phase::Reposition : Phase::Cast;
                 if (gAutoRespawn.load() &&
                     catchesSinceRespawn >= gRespawnEveryCatches.load() &&
                     ResetCharacter()) {
@@ -2156,6 +2530,37 @@ DWORD WINAPI TrackerThread(void*) {
                 phaseChangedAt = GetTickCount64();
             }
             current.collectAttempt = collectAttempt;
+        } else if (phase == Phase::Reposition) {
+            setMouse(false);
+            current.phase = phase;
+            {
+                std::lock_guard<std::mutex> lock(gTelemetryMutex);
+                gTelemetry = current;
+            }
+            PostMessage(gWindow, WM_TRACKER_UPDATE, 0, 0);
+            const WalkResult walk = WalkBackToAnchor();
+            positionOffset = walk.offset;
+            positionLost = walk.lost;
+            lostStreak = walk.lost ? lostStreak + 1 : 0;
+            if (walk.lost && lostStreak == 3 && gDiscordFailAlerts.load() && gDiscordEnabled.load()) {
+                DiscordJob job;
+                job.type = DiscordEvent::Failing;
+                wchar_t why[128];
+                swprintf_s(why, L"Lost position: couldn't walk back to the anchor (%d px off).", walk.offset);
+                job.detail = why;
+                job.sessionId = gCurrentSessionId;
+                job.catches = totalCatches;
+                job.ore = oreCount;
+                job.runningMs = runningMs;
+                CaptureFullScreen(job.pixels, job.w, job.h);
+                EnqueueDiscord(std::move(job));
+            }
+            current.positionLost = positionLost;
+            current.positionOffset = positionOffset;
+            phase = Phase::Cast;
+            current.phase = phase;
+            phaseChangedAt = GetTickCount64();
+            previousMs = PreciseMs();
         } else if (phase == Phase::Respawn) {
             setMouse(false);
             current.phaseElapsedMs = static_cast<float>(now - phaseChangedAt);
@@ -2442,6 +2847,8 @@ enum HitId {
     kHitMenuBackdrop = 90, kHitResetStats, kHitDiscordToggle, kHitDiscordPing, kHitDiscordFail,
     kHitDiscordTest, kHitDiscordChip0 = 100, // rarity/ORE chips: kHitDiscordChip0 + 0..5
     kHitDiscordHide = 110,
+    kHitRepoMode0 = 111, // reposition mode segments: kHitRepoMode0 + 0..2
+    kHitCalAnchor = 115, kHitLearnWalk,
 };
 struct HitRegion {
     RECT rect;
@@ -2700,7 +3107,18 @@ void DrawFishingTab(Gdiplus::Graphics& g, const Telemetry& t) {
     const wchar_t* headline = L"";
     Gdiplus::Color headColor = ui::kText;
     std::wstring detail;
-    if (!t.captureReady) {
+    if (t.learningWalk) {
+        headline = L"LEARNING STEPS";
+        headColor = ui::kWarn;
+        detail = L"Tapping W/A/S/D to learn the walk-back steps";
+    } else if (t.captureReady && gRepositionMode.load() == 2 && t.positionLost) {
+        headline = L"LOST POSITION";
+        headColor = ui::kBad;
+        wchar_t lost[96];
+        if (t.positionOffset >= 0) swprintf_s(lost, L"Anchor %d px off · tries again after the next catch", t.positionOffset);
+        else swprintf_s(lost, L"Anchor not visible · tries again after the next catch");
+        detail = lost;
+    } else if (!t.captureReady) {
         headline = L"NOT CALIBRATED";
         headColor = ui::kBad;
         detail = L"Set the bar + Exit button on the Setup tab";
@@ -2806,13 +3224,27 @@ void DrawFishingTab(Gdiplus::Graphics& g, const Telemetry& t) {
 
     const RectF resetTile(196, 322, 166, 76);
     DrawCard(g, resetTile);
-    const bool respawnOn = gAutoRespawn.load();
-    Text(g, L"UNTIL RESET", gFontLabel, respawnOn ? ui::kText : ui::kMuted, RectF(210, 332, 120, 16));
-    Text(g, L"auto reposition", gFontSmall, ui::kMuted, RectF(210, 347, 120, 14));
-    if (respawnOn) swprintf_s(line, L"%d / %d", t.catchesSinceRespawn, gRespawnEveryCatches.load());
-    else swprintf_s(line, L"OFF");
-    Text(g, line, gFontBig, respawnOn ? ui::kText : ui::kMuted, RectF(208, 362, 130, 32));
-    if (respawnOn) FillGradient(g, RectF(342, 338, 4, 44), 2.0f, true);
+    const int repoMode = gRepositionMode.load();
+    if (repoMode == 2) {
+        // Walk back: position status instead of the reset countdown.
+        Text(g, L"POSITION", gFontLabel, ui::kText, RectF(210, 332, 120, 16));
+        Text(g, L"walk back", gFontSmall, ui::kMuted, RectF(210, 347, 120, 14));
+        Gdiplus::Color colour = ui::kText;
+        if (!WalkLearned()) { swprintf_s(line, L"SET UP"); colour = ui::kWarn; }
+        else if (t.positionLost) { swprintf_s(line, L"LOST"); colour = ui::kBad; }
+        else if (t.positionOffset < 0) swprintf_s(line, L"—");
+        else swprintf_s(line, L"OK");
+        Text(g, line, gFontBig, colour, RectF(208, 362, 130, 32));
+        FillGradient(g, RectF(342, 338, 4, 44), 2.0f, true);
+    } else {
+        const bool respawnOn = repoMode == 1;
+        Text(g, L"UNTIL RESET", gFontLabel, respawnOn ? ui::kText : ui::kMuted, RectF(210, 332, 120, 16));
+        Text(g, L"auto reposition", gFontSmall, ui::kMuted, RectF(210, 347, 120, 14));
+        if (respawnOn) swprintf_s(line, L"%d / %d", t.catchesSinceRespawn, gRespawnEveryCatches.load());
+        else swprintf_s(line, L"OFF");
+        Text(g, line, gFontBig, respawnOn ? ui::kText : ui::kMuted, RectF(208, 362, 130, 32));
+        if (respawnOn) FillGradient(g, RectF(342, 338, 4, 44), 2.0f, true);
+    }
 
     DrawOreRarityCard(g, t, 410.0f, true);
 
@@ -2884,14 +3316,29 @@ void DrawSettingsTab(Gdiplus::Graphics& g) {
                                 L"Auto reposition", L"Reset every", L"Minigame log"};
     const wchar_t* subs[6] = {L"seconds before re-casting", L"seconds before holding T",
                               L"max; lets go when the item shows",
-                              L"reset character (Esc · R · Enter)",
+                              L"",
                               L"minigames (also after 2 missed casts)",
                               L"CSV + item captures in logs\\ (tuning)"};
     for (int row = 0; row < 6; ++row) {
         const float y = SettingsRowY(row);
         if (row > 0) Divider(g, y - 3.0f);
         RowLabel(g, y, titles[row], subs[row]);
-        if (row == 3) DrawToggle(g, y, gAutoRespawn.load(), kHitRespawnToggle);
+        if (row == 3) {
+            // Off / Reset (gamepass) / Walk back
+            const int mode = gRepositionMode.load();
+            const wchar_t* sub = mode == 1 ? L"reset character (Esc · R · Enter)"
+                               : mode == 2 ? L"walks back with W/A/S/D" : L"character is not moved";
+            Text(g, sub, gFontSmall, ui::kMuted, RectF(34.0f, y + 22.0f, 170.0f, 15.0f));
+            const wchar_t* labels[3] = {L"Off", L"Reset", L"Walk"};
+            FillInset(g, RectF(204, y + 6, 142, 28), 10.0f);
+            for (int i = 0; i < 3; ++i) {
+                const RectF seg(206.0f + i * 46.0f, y + 8, 46.0f, 24.0f);
+                if (mode == i) FillGradient(g, seg, 9.0f);
+                else HoverOverlay(g, seg, 9.0f, kHitRepoMode0 + i);
+                TextCenter(g, labels[i], gFontLabel, mode == i ? ui::kText : ui::kMuted, seg);
+                AddHit(seg, kHitRepoMode0 + i);
+            }
+        }
         else if (row == 5) DrawToggle(g, y, gMinigameLog.load(), kHitLogToggle);
         else FillInset(g, RectF(266, y + 5, 80, 30), 9.0f);
     }
@@ -2937,9 +3384,9 @@ void DrawHotkeysTab(Gdiplus::Graphics& g) {
 
 void DrawCalibrationRow(Gdiplus::Graphics& g, float y, const wchar_t* title, const wchar_t* value,
                         bool isSet, int id, bool active) {
-    DrawCard(g, RectF(18, y, 344, 70));
-    RowLabel(g, y + 14, title, value, isSet ? ui::kMuted : ui::kBad);
-    const RectF button(236, y + 17, 110, 36);
+    DrawCard(g, RectF(18, y, 344, 60));
+    RowLabel(g, y + 10, title, value, isSet ? ui::kMuted : ui::kBad);
+    const RectF button(236, y + 12, 110, 36);
     if (active) InsetButton(g, button, L"Cancel", id, ui::kWarn);
     else GradientButton(g, button, L"Calibrate", id);
 }
@@ -2954,6 +3401,8 @@ void DrawSetupTab(Gdiplus::Graphics& g) {
             ? L"CLICK the spot to cast at"
             : (gCalibrationTarget == CalibrationTarget::CollectRegion)
                 ? L"DRAG a box where \"<item> x1\" appears"
+            : (gCalibrationTarget == CalibrationTarget::AnchorRegion)
+                ? L"DRAG a box over something that doesn't move"
                 : L"DRAG a box over the region";
         Text(g, banner, gFontBody, ui::kWarn, RectF(34, 158, 310, 18));
         Text(g, L"Esc cancels", gFontSmall, ui::kMuted, RectF(34, 177, 310, 15));
@@ -2965,21 +3414,21 @@ void DrawSetupTab(Gdiplus::Graphics& g) {
 
     const POINT cast = GetCastPoint();
     swprintf_s(line, L"(%ld, %ld)", cast.x, cast.y);
-    DrawCalibrationRow(g, 214, L"Cast point", line, true, kHitCalCast,
+    DrawCalibrationRow(g, 210, L"Cast point", line, true, kHitCalCast,
                        calibrating && gCalibrationTarget == CalibrationTarget::CastPoint);
 
     const RECT bar = GetBarRect();
     const bool barSet = RectCalibrated(bar);
     if (barSet) swprintf_s(line, L"%ldx%ld at (%ld, %ld)", bar.right - bar.left, bar.bottom - bar.top, bar.left, bar.top);
     else swprintf_s(line, L"NOT SET");
-    DrawCalibrationRow(g, 298, L"Fishing bar", line, barSet, kHitCalBar,
+    DrawCalibrationRow(g, 276, L"Fishing bar", line, barSet, kHitCalBar,
                        calibrating && gCalibrationTarget == CalibrationTarget::BarRegion);
 
     const RECT exitR = GetExitRect();
     const bool exitSet = RectCalibrated(exitR);
     if (exitSet) swprintf_s(line, L"%ldx%ld at (%ld, %ld)", exitR.right - exitR.left, exitR.bottom - exitR.top, exitR.left, exitR.top);
     else swprintf_s(line, L"NOT SET");
-    DrawCalibrationRow(g, 382, L"Exit button", line, exitSet, kHitCalExit,
+    DrawCalibrationRow(g, 342, L"Exit button", line, exitSet, kHitCalExit,
                        calibrating && gCalibrationTarget == CalibrationTarget::ExitRegion);
 
     const RECT collect = GetCollectRect();
@@ -2990,8 +3439,37 @@ void DrawSetupTab(Gdiplus::Graphics& g) {
     } else {
         swprintf_s(line, L"NOT SET · box the item message");
     }
-    DrawCalibrationRow(g, 466, L"Collect message", line, collectSet, kHitCalCollect,
+    DrawCalibrationRow(g, 408, L"Collect message", line, collectSet, kHitCalCollect,
                        calibrating && gCalibrationTarget == CalibrationTarget::CollectRegion);
+
+    // Position anchor (walk back): calibrate + learn the W/A/S/D steps.
+    {
+        const float y = 474.0f;
+        DrawCard(g, RectF(18, y, 344, 60));
+        Telemetry t;
+        {
+            std::lock_guard<std::mutex> lock(gTelemetryMutex);
+            t = gTelemetry;
+        }
+        const bool ready = AnchorReady();
+        const bool learned = WalkLearned();
+        if (t.learningWalk || gLearnWalkRequested.load()) swprintf_s(line, L"learning W/A/S/D steps...");
+        else if (!ready) swprintf_s(line, L"NOT SET · box a spot that never moves");
+        else if (!learned) swprintf_s(line, L"steps not learned · click Learn");
+        else {
+            std::lock_guard<std::mutex> lock(gAnchorMutex);
+            float avg = 0;
+            for (const WalkStep& st : gWalkSteps) avg += std::hypot(st.x, st.y) / 4.0f;
+            swprintf_s(line, L"ready · ~%.1f px per step", avg);
+        }
+        RowLabel(g, y + 10, L"Position anchor", line, learned ? ui::kMuted : (ready ? ui::kWarn : ui::kBad));
+        const bool active = calibrating && gCalibrationTarget == CalibrationTarget::AnchorRegion;
+        if (active) InsetButton(g, RectF(236, y + 12, 110, 36), L"Cancel", kHitCalAnchor, ui::kWarn);
+        else {
+            GradientButton(g, RectF(236, y + 12, 52, 36), L"Set", kHitCalAnchor);
+            if (ready) InsetButton(g, RectF(294, y + 12, 52, 36), L"Learn", kHitLearnWalk, ui::kSoft);
+        }
+    }
 }
 
 // Auto bait buy page. The two EDIT controls sit on the inset boxes of the
@@ -3517,6 +3995,8 @@ void ToggleTracker() {
     InvalidateRect(gWindow, nullptr, FALSE);
 }
 
+RECT gPendingAnchor{0, 0, 0, 0}; // anchor box just dragged (reference captured in WindowProc)
+
 // While calibrating, a low-level mouse hook swallows left-button input and
 // reports it back to the window (via WM_CALIBRATION_DONE) instead of
 // letting it reach whatever is underneath. The Cast point is a single
@@ -3557,7 +4037,8 @@ LRESULT CALLBACK CalibrationMouseProc(int code, WPARAM wParam, LPARAM lParam) {
 
     if (gCalibrationTarget == CalibrationTarget::BarRegion ||
         gCalibrationTarget == CalibrationTarget::ExitRegion ||
-        gCalibrationTarget == CalibrationTarget::CollectRegion) {
+        gCalibrationTarget == CalibrationTarget::CollectRegion ||
+        gCalibrationTarget == CalibrationTarget::AnchorRegion) {
         if (wParam == WM_LBUTTONDOWN) {
             gDragStart = pt;
             gDragging = true;
@@ -3570,6 +4051,7 @@ LRESULT CALLBACK CalibrationMouseProc(int code, WPARAM wParam, LPARAM lParam) {
             if (RectCalibrated(rect)) {
                 if (gCalibrationTarget == CalibrationTarget::BarRegion) SetBarRect(rect);
                 else if (gCalibrationTarget == CalibrationTarget::ExitRegion) SetExitRect(rect);
+                else if (gCalibrationTarget == CalibrationTarget::AnchorRegion) gPendingAnchor = rect;
                 else SetCollectRect(rect);
                 PostMessage(gWindow, WM_CALIBRATION_DONE, 0, 0);
             }
@@ -3683,6 +4165,26 @@ void LoadSettings() {
         kMinWaitForFishMs, kMaxWaitForFishMs);
     gWaitForFishMs.store(waitMs);
     gAutoRespawn.store(GetPrivateProfileIntW(L"Fishing", L"AutoRespawn", 0, path.c_str()) != 0);
+    gRepositionMode.store(std::clamp(ReadIntSetting(L"Reposition", L"Mode", gAutoRespawn.load() ? 1 : 0, path), 0, 2));
+    gAutoRespawn.store(gRepositionMode.load() == 1);
+    {
+        const RECT anchor{ReadIntSetting(L"Reposition", L"AnchorLeft", 0, path),
+                          ReadIntSetting(L"Reposition", L"AnchorTop", 0, path),
+                          ReadIntSetting(L"Reposition", L"AnchorRight", 0, path),
+                          ReadIntSetting(L"Reposition", L"AnchorBottom", 0, path)};
+        LoadAnchorReference(anchor);
+        const wchar_t* names[4] = {L"W", L"A", L"S", L"D"};
+        bool learned = ReadIntSetting(L"Reposition", L"Learned", 0, path) != 0;
+        std::lock_guard<std::mutex> lock(gAnchorMutex);
+        for (int k = 0; k < 4; ++k) {
+            wchar_t kx[16], ky[16];
+            swprintf_s(kx, L"%lsx100", names[k]);
+            swprintf_s(ky, L"%lsy100", names[k]);
+            gWalkSteps[k].x = ReadIntSetting(L"Reposition", kx, 0, path) / 100.0f;
+            gWalkSteps[k].y = ReadIntSetting(L"Reposition", ky, 0, path) / 100.0f;
+        }
+        gWalkLearned = learned && !gAnchorEdges.empty();
+    }
     gRespawnEveryCatches.store(std::clamp<int>(
         ReadIntSetting(L"Fishing", L"RespawnEveryCatches", kDefaultRespawnEveryCatches, path),
         kMinRespawnEveryCatches, kMaxRespawnEveryCatches));
@@ -3784,6 +4286,24 @@ void SaveSettings() {
     swprintf_s(buf, L"%u", static_cast<unsigned>(gWaitForFishMs.load() / 1000));
     WritePrivateProfileStringW(L"Fishing", L"WaitForFishSeconds", buf, path.c_str());
     WriteIntSetting(L"Fishing", L"AutoRespawn", gAutoRespawn.load() ? 1 : 0, path);
+    WriteIntSetting(L"Reposition", L"Mode", gRepositionMode.load(), path);
+    {
+        const RECT anchor = GetAnchorRect();
+        WriteIntSetting(L"Reposition", L"AnchorLeft", anchor.left, path);
+        WriteIntSetting(L"Reposition", L"AnchorTop", anchor.top, path);
+        WriteIntSetting(L"Reposition", L"AnchorRight", anchor.right, path);
+        WriteIntSetting(L"Reposition", L"AnchorBottom", anchor.bottom, path);
+        const wchar_t* names[4] = {L"W", L"A", L"S", L"D"};
+        std::lock_guard<std::mutex> lock(gAnchorMutex);
+        WriteIntSetting(L"Reposition", L"Learned", gWalkLearned ? 1 : 0, path);
+        for (int k = 0; k < 4; ++k) {
+            wchar_t kx[16], ky[16];
+            swprintf_s(kx, L"%lsx100", names[k]);
+            swprintf_s(ky, L"%lsy100", names[k]);
+            WriteIntSetting(L"Reposition", kx, static_cast<int>(std::lround(gWalkSteps[k].x * 100)), path);
+            WriteIntSetting(L"Reposition", ky, static_cast<int>(std::lround(gWalkSteps[k].y * 100)), path);
+        }
+    }
     WriteIntSetting(L"Fishing", L"RespawnEveryCatches", gRespawnEveryCatches.load(), path);
     WriteIntSetting(L"Fishing", L"CollectDelayMs", static_cast<int>(gCollectDelayMs.load()), path);
     WriteIntSetting(L"Fishing", L"HoldKeyMs", static_cast<int>(gHoldKeyMs.load()), path);
@@ -4121,6 +4641,21 @@ void HandleHit(HWND hwnd, int id) {
             gMinigameLog.store(!gMinigameLog.load());
             SaveSettings();
             break;
+        case kHitRepoMode0: case kHitRepoMode0 + 1: case kHitRepoMode0 + 2:
+            gRepositionMode.store(id - kHitRepoMode0);
+            gAutoRespawn.store(gRepositionMode.load() == 1);
+            SaveSettings();
+            break;
+        case kHitCalAnchor:
+            if (gCalibrating.load() && gCalibrationTarget == CalibrationTarget::AnchorRegion) EndCalibration();
+            else StartCalibration(CalibrationTarget::AnchorRegion);
+            break;
+        case kHitLearnWalk:
+            if (AnchorReady()) {
+                gEnabled.store(false);
+                gLearnWalkRequested.store(true);
+            }
+            break;
         case kHitRespawnToggle:
             gAutoRespawn.store(!gAutoRespawn.load());
             SaveSettings();
@@ -4398,12 +4933,24 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             // calibrating the bar/exit regions would be an unwanted extra cast.
             const CalibrationTarget justCalibrated = gCalibrationTarget;
             EndCalibration();
+            if (justCalibrated == CalibrationTarget::AnchorRegion) {
+                // Store the reference image, then learn the W/A/S/D steps.
+                Sleep(150); // let the selection overlay/cursor settle
+                if (CaptureAnchorReference(gPendingAnchor)) {
+                    gEnabled.store(false);
+                    gLearnWalkRequested.store(true);
+                }
+            }
             SaveSettings();
             if (justCalibrated == CalibrationTarget::CastPoint && FocusGame()) {
                 ClickAt(GetCastPoint());
             }
             return 0;
         }
+        case WM_CALIBRATION_DONE + 100: // walk steps learned (tracker thread)
+            SaveSettings();
+            InvalidateRect(hwnd, nullptr, FALSE);
+            return 0;
         case WM_KEYBIND_DONE: {
             const int target = gBindingTarget;
             const WORD vk = gCapturedVk;

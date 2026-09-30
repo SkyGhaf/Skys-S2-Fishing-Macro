@@ -7,3 +7,4 @@
 *.ini
 logs/
 *_sessions.txt
+*_anchor.bmp
