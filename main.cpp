@@ -1024,7 +1024,12 @@ int ClassifyRarity(const std::vector<uint32_t>& frame, const std::vector<uint32_
     double bestScore = -1e9;
     int bestY = -1;
     int bestColour[3] = {};
-    for (int y = 2; y < h * 45 / 100; ++y) {
+    // The banner's top line sits at the very top of the region: rows 4-5 of
+    // 50 in all 5742 logged messages. Lines lower down are something else,
+    // e.g. the edge of a fish's "Collect" prompt (read as a black line, so an
+    // Impossible that wasn't).
+    const int lastRow = std::max(6, h * 16 / 100);
+    for (int y = 2; y <= lastRow; ++y) {
         int colour[3], unused[3];
         const double now = LineStrength(frame.data(), w, h, y, colour);
         const double before = LineStrength(baseline.data(), w, h, y, unused);
