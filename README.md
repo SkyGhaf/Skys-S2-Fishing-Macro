@@ -40,6 +40,16 @@ on your own screen, so it runs at any resolution.
   one shows its catches, no item, success rate, time fished, ORE (+ ORE per hour) and rarity drops.
   Sessions can be deleted. On startup the macro offers to continue the last session.
 - **ORE per hour** is shown next to the ORE counter, based on the time actually spent fishing.
+- **Discord notifications (Discord page):** paste a channel webhook link to get a message for the
+  rarities you tick (for example everything except Common). ORE comes with a picture of the item
+  message, and Impossible with a full screenshot. A **failing to fish** alert with a screenshot is
+  sent after 3 failed tries in a row or no catch for N minutes (useful for disconnects), and an
+  optional **@everyone** ping can be added. Screenshots carry the cloud logo in the top-left.
+  Everything is sent from a background thread, so fishing never waits on it.
+- **Reset stats:** a button next to LIVE/OFF (click twice). It saves the current session and starts
+  a fresh one.
+- **Menu (☰):** all pages are in a burger menu: Fishing, Sessions, Settings, Hotkeys, Setup, Auto
+  Bait, Discord and **Credits**.
 - **Equip on start:** every time you press Start it quickly taps the *correction key* (default
   `1`) and then the *rod key* (default `5`). You can change both in the **Hotkeys** tab.
 - **Collect delay / Hold T time:** choose how long to wait after the minigame before holding **T**,

@@ -7,6 +7,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <winhttp.h>
 #include <windowsx.h>
 #include <commctrl.h>
 #include <dwmapi.h>
@@ -23,7 +24,7 @@
 #include <vector>
 #include <ctime>
 
-#include "fish_icons.h"
+#include "cloud_icon.h"
 #include "wen_icon.h"
 
 #pragma comment(lib, "dwmapi.lib")
@@ -53,6 +54,8 @@ constexpr int ID_COLLECT_EDIT = 1012;
 constexpr int ID_HOLD_EDIT = 1013;
 constexpr int ID_BAIT_AMOUNT_EDIT = 1014;
 constexpr int ID_BAIT_DELAY_EDIT = 1015;
+constexpr int ID_DISCORD_URL_EDIT = 1016;
+constexpr int ID_DISCORD_MIN_EDIT = 1017;
 constexpr int HOTKEY_TOGGLE = 1;
 constexpr int HOTKEY_QUIT = 2;
 constexpr int HOTKEY_BAIT = 4; // Auto Bait start/stop
@@ -255,8 +258,7 @@ HHOOK gKeyboardHook = nullptr;
 
 // GDI+ is only used to decode/draw the two embedded LIVE/OFF fish-icon PNGs.
 ULONG_PTR gGdiplusToken = 0;
-Gdiplus::Bitmap* gFishOnIcon = nullptr;
-Gdiplus::Bitmap* gFishOffIcon = nullptr;
+Gdiplus::Bitmap* gCloudIcon = nullptr; // the logo (header, app icon, Credits, Discord screenshots)
 Gdiplus::Bitmap* gWenIcon = nullptr; // Auto Bait wen calculator
 
 Gdiplus::Bitmap* LoadPngFromMemory(const unsigned char* data, size_t size) {
@@ -350,6 +352,11 @@ std::atomic<ULONGLONG> gBaitStartMs{0};        // when the current purchase run 
 constexpr int kBaitClickOverheadMs = 290;
 std::atomic<bool> gBaitFocusLost{false};       // last run stopped: game not in front
 HWND gBaitAmountEdit = nullptr;
+HWND gDiscordUrlEdit = nullptr;
+HWND gDiscordMinEdit = nullptr;
+HFONT gSmallEditFont = nullptr;
+bool gMenuOpen = false;        // burger menu (UI thread)
+bool gResetArmed = false;      // "Reset stats" needs a second click
 HWND gBaitDelayEdit = nullptr;
 
 POINT GetBaitPoint(int i) {
@@ -1140,6 +1147,267 @@ struct MinigameLog {
     }
 };
 
+// ---------------------------------------------------------------------------
+// Discord notifications: the tracker only queues a job; a separate thread
+// makes the screenshot PNG and sends it, so fishing never waits on it.
+// ---------------------------------------------------------------------------
+enum class DiscordEvent { Item, Ore, Failing, Test };
+struct DiscordJob {
+    DiscordEvent type = DiscordEvent::Test;
+    int rarity = -1;
+    int sessionId = 0;
+    int catches = 0;
+    int ore = 0;
+    double runningMs = 0.0;
+    std::wstring detail;             // e.g. why "failing to fish"
+    std::vector<uint32_t> pixels;    // optional screenshot
+    int w = 0, h = 0;
+    bool itemCapture = false;        // small item-message capture (framed) vs full screen
+};
+std::mutex gDiscordMutex;
+std::vector<DiscordJob> gDiscordQueue;
+HANDLE gDiscordWake = nullptr;
+std::mutex gDiscordUrlMutex;
+std::wstring gDiscordUrl;
+std::atomic<bool> gDiscordEnabled{false};
+std::atomic<bool> gDiscordPing{false};
+std::atomic<bool> gDiscordFailAlerts{true};
+std::atomic<bool> gDiscordOre{true};
+std::atomic<bool> gDiscordRarity[5] = {{true}, {true}, {true}, {false}, {false}}; // Impossible..Common
+std::atomic<int> gDiscordNoCatchMin{10};
+std::atomic<int> gDiscordLastStatus{0};      // 0 = nothing sent yet, HTTP status, -1 = failed
+std::atomic<long long> gDiscordLastTime{0};
+
+std::wstring GetDiscordUrl() {
+    std::lock_guard<std::mutex> lock(gDiscordUrlMutex);
+    return gDiscordUrl;
+}
+
+void EnqueueDiscord(DiscordJob&& job) {
+    if (!gDiscordEnabled.load() || GetDiscordUrl().empty()) return;
+    {
+        std::lock_guard<std::mutex> lock(gDiscordMutex);
+        if (gDiscordQueue.size() >= 8) return; // never pile up (e.g. no internet)
+        gDiscordQueue.push_back(std::move(job));
+    }
+    if (gDiscordWake) SetEvent(gDiscordWake);
+}
+
+bool CaptureFullScreen(std::vector<uint32_t>& pixels, int& w, int& h) {
+    w = GetSystemMetrics(SM_CXSCREEN);
+    h = GetSystemMetrics(SM_CYSCREEN);
+    CaptureSurface surface;
+    if (!surface.Create(w, h) || !surface.Grab(0, 0)) return false;
+    pixels.assign(surface.pixels, surface.pixels + static_cast<size_t>(w) * h);
+    return true;
+}
+
+std::string ToUtf8(const std::wstring& text) {
+    if (text.empty()) return {};
+    const int n = WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), nullptr, 0, nullptr, nullptr);
+    std::string out(n, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, text.c_str(), static_cast<int>(text.size()), &out[0], n, nullptr, nullptr);
+    return out;
+}
+
+std::string JsonEscape(const std::string& in) {
+    std::string out;
+    for (const char c : in) {
+        if (c == '"' || c == '\\') { out += '\\'; out += c; }
+        else if (c == '\n') out += "\\n";
+        else out += c;
+    }
+    return out;
+}
+
+bool PngEncoderClsid(CLSID& clsid) {
+    UINT count = 0, size = 0;
+    Gdiplus::GetImageEncodersSize(&count, &size);
+    if (size == 0) return false;
+    std::vector<unsigned char> buffer(size);
+    auto* codecs = reinterpret_cast<Gdiplus::ImageCodecInfo*>(buffer.data());
+    Gdiplus::GetImageEncoders(count, size, codecs);
+    for (UINT i = 0; i < count; ++i) {
+        if (wcscmp(codecs[i].MimeType, L"image/png") == 0) {
+            clsid = codecs[i].Clsid;
+            return true;
+        }
+    }
+    return false;
+}
+
+// Screenshot -> PNG with the cloud logo in the top-left corner (below
+// Roblox's own buttons). A small item-message capture gets a dark header
+// band for the logo instead, so nothing of the message is covered.
+bool MakeDiscordPng(const DiscordJob& job, std::vector<unsigned char>& png) {
+    if (job.pixels.empty() || job.w <= 0 || job.h <= 0) return false;
+    Gdiplus::Bitmap source(job.w, job.h, job.w * 4, PixelFormat32bppRGB,
+                           reinterpret_cast<BYTE*>(const_cast<uint32_t*>(job.pixels.data())));
+    const int scale = job.itemCapture ? 2 : 1;
+    const int band = job.itemCapture ? 64 : 0;
+    const int outW = job.w * scale, outH = job.h * scale + band;
+    Gdiplus::Bitmap canvas(outW, outH, PixelFormat32bppARGB);
+    {
+        Gdiplus::Graphics g(&canvas);
+        g.SetInterpolationMode(job.itemCapture ? Gdiplus::InterpolationModeHighQualityBicubic
+                                               : Gdiplus::InterpolationModeNearestNeighbor);
+        g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
+        g.Clear(Gdiplus::Color(255, 40, 41, 70));
+        g.DrawImage(&source, Gdiplus::RectF(0, static_cast<float>(band), static_cast<float>(outW),
+                                   static_cast<float>(job.h * scale)));
+        if (gCloudIcon) {
+            if (job.itemCapture) {
+                g.DrawImage(gCloudIcon, Gdiplus::RectF(12, 8, 65, 48));
+                Gdiplus::Font font(L"Segoe UI", 20.0f, Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
+                Gdiplus::SolidBrush white(Gdiplus::Color(255, 240, 242, 255));
+                g.DrawString(L"Sky's S2 Fishing Macro", -1, &font, Gdiplus::PointF(88, 18), &white);
+            } else {
+                const float cw = std::max(80.0f, outW * 0.06f);
+                g.DrawImage(gCloudIcon, Gdiplus::RectF(outW * 0.01f, outH * 0.065f, cw, cw * 230.0f / 312.0f));
+            }
+        }
+    }
+    CLSID pngClsid;
+    if (!PngEncoderClsid(pngClsid)) return false;
+    IStream* stream = nullptr;
+    if (CreateStreamOnHGlobal(nullptr, TRUE, &stream) != S_OK) return false;
+    bool ok = canvas.Save(stream, &pngClsid, nullptr) == Gdiplus::Ok;
+    if (ok) {
+        HGLOBAL mem = nullptr;
+        GetHGlobalFromStream(stream, &mem);
+        STATSTG stat{};
+        stream->Stat(&stat, STATFLAG_NONAME);
+        const size_t bytes = static_cast<size_t>(stat.cbSize.QuadPart);
+        const void* data = GlobalLock(mem);
+        ok = data != nullptr;
+        if (ok) png.assign(static_cast<const unsigned char*>(data), static_cast<const unsigned char*>(data) + bytes);
+        GlobalUnlock(mem);
+    }
+    stream->Release();
+    return ok;
+}
+
+// POSTs a webhook message (multipart when there is a picture). Returns the
+// HTTP status, or -1 if it couldn't be sent.
+int PostDiscord(const std::wstring& url, const std::string& json, const std::vector<unsigned char>& png) {
+    wchar_t host[256] = {}, path[2048] = {};
+    URL_COMPONENTS parts{};
+    parts.dwStructSize = sizeof(parts);
+    parts.lpszHostName = host;
+    parts.dwHostNameLength = 256;
+    parts.lpszUrlPath = path;
+    parts.dwUrlPathLength = 2048;
+    if (!WinHttpCrackUrl(url.c_str(), 0, 0, &parts) || parts.nScheme != INTERNET_SCHEME_HTTPS) return -1;
+    int status = -1;
+    HINTERNET session = WinHttpOpen(L"SkysS2FishingMacro/3.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+                                    WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!session) return -1;
+    WinHttpSetTimeouts(session, 5000, 5000, 15000, 15000);
+    HINTERNET connect = WinHttpConnect(session, host, parts.nPort, 0);
+    HINTERNET request = connect ? WinHttpOpenRequest(connect, L"POST", path, nullptr, WINHTTP_NO_REFERER,
+                                                     WINHTTP_DEFAULT_ACCEPT_TYPES, WINHTTP_FLAG_SECURE)
+                                : nullptr;
+    if (request) {
+        const std::string boundary = "----SkysS2FishingMacroBoundary7d1f";
+        std::string body = "--" + boundary + "\r\nContent-Disposition: form-data; name=\"payload_json\"\r\n"
+                           "Content-Type: application/json\r\n\r\n" + json + "\r\n";
+        if (!png.empty()) {
+            body += "--" + boundary + "\r\nContent-Disposition: form-data; name=\"files[0]\"; filename=\"shot.png\"\r\n"
+                    "Content-Type: image/png\r\n\r\n";
+            body.append(reinterpret_cast<const char*>(png.data()), png.size());
+            body += "\r\n";
+        }
+        body += "--" + boundary + "--\r\n";
+        const std::wstring header = L"Content-Type: multipart/form-data; boundary=" +
+                                    std::wstring(boundary.begin(), boundary.end());
+        if (WinHttpSendRequest(request, header.c_str(), static_cast<DWORD>(-1L), body.data(),
+                               static_cast<DWORD>(body.size()), static_cast<DWORD>(body.size()), 0) &&
+            WinHttpReceiveResponse(request, nullptr)) {
+            DWORD code = 0, size = sizeof(code);
+            WinHttpQueryHeaders(request, WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+                                WINHTTP_HEADER_NAME_BY_INDEX, &code, &size, WINHTTP_NO_HEADER_INDEX);
+            status = static_cast<int>(code);
+        }
+        WinHttpCloseHandle(request);
+    }
+    if (connect) WinHttpCloseHandle(connect);
+    WinHttpCloseHandle(session);
+    return status;
+}
+
+std::string DiscordJson(const DiscordJob& job, bool hasImage) {
+    static const char* const rarityNames[5] = {"Impossible", "Mythic", "Legendary", "Rare", "Common"};
+    static const int rarityColours[5] = {0x1B1B22, 0xF85252, 0xFABE32, 0x4696FF, 0xA5A8B9};
+    std::string title, description;
+    int colour = 0x2D6CFF;
+    switch (job.type) {
+        case DiscordEvent::Ore:
+            title = "\xE2\x9B\x8F\xEF\xB8\x8F ORE caught!";
+            description = "Everyone's favourite drop just landed.";
+            colour = 0x00E5A0;
+            break;
+        case DiscordEvent::Item:
+            if (job.rarity >= 0 && job.rarity < 5) {
+                title = std::string(rarityNames[job.rarity]) + " catch!";
+                colour = rarityColours[job.rarity];
+                if (job.rarity == 0) description = "\xF0\x9F\x8E\x89 An IMPOSSIBLE item - the rarest there is!";
+            }
+            break;
+        case DiscordEvent::Failing:
+            title = "\xE2\x9A\xA0\xEF\xB8\x8F Failing to fish - go check!";
+            description = ToUtf8(job.detail);
+            colour = 0xF59E0B;
+            break;
+        case DiscordEvent::Test:
+            title = "\xE2\x9C\x85 Test message";
+            description = "Discord notifications are working.";
+            break;
+    }
+    char fields[512];
+    const double hours = job.runningMs / 3600000.0;
+    const long long minutes = static_cast<long long>(job.runningMs / 60000.0);
+    snprintf(fields, sizeof(fields),
+             "[{\"name\":\"Session\",\"value\":\"#%d\",\"inline\":true},"
+             "{\"name\":\"Catches\",\"value\":\"%d\",\"inline\":true},"
+             "{\"name\":\"ORE\",\"value\":\"%d (%.1f/h)\",\"inline\":true},"
+             "{\"name\":\"Time fished\",\"value\":\"%lldh %02lldm\",\"inline\":true}]",
+             job.sessionId, job.catches, job.ore, hours > 0.016 ? job.ore / hours : 0.0, minutes / 60, minutes % 60);
+    const bool ping = gDiscordPing.load();
+    std::string json = "{\"username\":\"Sky's S2 Fishing Macro\",";
+    json += "\"content\":\"" + std::string(ping ? "@everyone" : "") + "\",";
+    json += std::string("\"allowed_mentions\":{\"parse\":[") + (ping ? "\"everyone\"" : "") + "]},";
+    json += "\"embeds\":[{\"title\":\"" + JsonEscape(title) + "\",";
+    if (!description.empty()) json += "\"description\":\"" + JsonEscape(description) + "\",";
+    json += "\"color\":" + std::to_string(colour) + ",\"fields\":" + fields + ",";
+    if (hasImage) json += "\"image\":{\"url\":\"attachment://shot.png\"},";
+    json += "\"footer\":{\"text\":\"Sky's S2 Fishing Macro \xE2\x80\xA2 by Sky\"}}]}";
+    return json;
+}
+
+DWORD WINAPI DiscordThread(void*) {
+    while (!gQuit.load()) {
+        WaitForSingleObject(gDiscordWake, 1000);
+        for (;;) {
+            DiscordJob job;
+            {
+                std::lock_guard<std::mutex> lock(gDiscordMutex);
+                if (gDiscordQueue.empty()) break;
+                job = std::move(gDiscordQueue.front());
+                gDiscordQueue.erase(gDiscordQueue.begin());
+            }
+            if (gQuit.load()) return 0;
+            std::vector<unsigned char> png;
+            const bool hasImage = MakeDiscordPng(job, png);
+            const int status = PostDiscord(GetDiscordUrl(), DiscordJson(job, hasImage), png);
+            gDiscordLastStatus.store(status);
+            gDiscordLastTime.store(static_cast<long long>(time(nullptr)));
+            if (gWindow) PostMessage(gWindow, WM_TRACKER_UPDATE, 0, 0);
+            Sleep(600); // stays well under Discord's webhook rate limit
+        }
+    }
+    return 0;
+}
+
 DWORD WINAPI TrackerThread(void*) {
     timeBeginPeriod(1);
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
@@ -1220,6 +1488,11 @@ DWORD WINAPI TrackerThread(void*) {
     bool lastWasOre = false;
     double runningMs = 0.0;          // fishing time this session
     double lastLoopMs = PreciseMs();
+    // "Failing to fish" alert: 3 failed tries in a row, or no catch for N
+    // minutes of fishing. Sent once, then armed again by the next catch.
+    int failStreak = 0;
+    double runningAtLastCatch = 0.0;
+    bool failAlertSent = false;
     int attemptRarity = kRarityCommon; // best classification during this attempt
     int attemptBestScore = -1;
     std::vector<uint32_t> attemptRarityFrame; // clearest frame of the message (rarity is read from it)
@@ -1335,12 +1608,37 @@ DWORD WINAPI TrackerThread(void*) {
                 oreCount = gRestoreData.ore;
                 for (int i = 0; i < kRarityCount; ++i) rarityCounts[i] = gRestoreData.rarity[i];
                 runningMs = static_cast<double>(gRestoreData.runningMs);
+                lastRarity = -1;
+                lastWasOre = false;
+                lastCollectDetected = -1;
+                failStreak = 0;
+                runningAtLastCatch = runningMs;
+                failAlertSent = false;
             }
         }
         // Real elapsed time (not the clamped dtMs): casting/collecting can
         // block this loop for a second or more.
         if (gEnabled.load() && !gBaitRunning.load()) runningMs += nowMs - lastLoopMs;
         lastLoopMs = nowMs;
+        if (gEnabled.load() && !failAlertSent && gDiscordFailAlerts.load() && gDiscordEnabled.load()) {
+            const double noCatchMs = gDiscordNoCatchMin.load() * 60000.0;
+            const bool streak = failStreak >= 3;
+            if (streak || (noCatchMs > 0 && runningMs - runningAtLastCatch >= noCatchMs)) {
+                failAlertSent = true;
+                DiscordJob job;
+                job.type = DiscordEvent::Failing;
+                wchar_t why[128];
+                if (streak) swprintf_s(why, L"%d tries in a row without a catch.", failStreak);
+                else swprintf_s(why, L"No catch for %d minutes of fishing.", gDiscordNoCatchMin.load());
+                job.detail = why;
+                job.sessionId = gCurrentSessionId;
+                job.catches = totalCatches;
+                job.ore = oreCount;
+                job.runningMs = runningMs;
+                CaptureFullScreen(job.pixels, job.w, job.h);
+                EnqueueDiscord(std::move(job));
+            }
+        }
 
         Telemetry current{};
         current.enabled = gEnabled.load();
@@ -1451,6 +1749,7 @@ DWORD WINAPI TrackerThread(void*) {
                 exitSeenWhileWaiting = false;
                 phase = Phase::Cast;
                 ++missedCastsInARow;
+                ++failStreak;
                 if (gAutoRespawn.load() && missedCastsInARow >= kMissedCastsBeforeRespawn &&
                     ResetCharacter()) {
                     missedCastsInARow = 0;
@@ -1742,10 +2041,35 @@ DWORD WINAPI TrackerThread(void*) {
                         if (lastWasOre) ++oreCount;
                         saveCollectCapture(lastWasOre ? L"ORE" : kRarityNames[attemptRarity],
                                            attemptRarityFrame);
+                        // Discord: ORE with its item-message capture, Impossible
+                        // with a full screenshot, other ticked rarities as text.
+                        const bool oreMessage = lastWasOre && gDiscordOre.load();
+                        if (oreMessage || gDiscordRarity[attemptRarity].load()) {
+                            DiscordJob job;
+                            job.type = oreMessage ? DiscordEvent::Ore : DiscordEvent::Item;
+                            job.rarity = attemptRarity;
+                            job.sessionId = gCurrentSessionId;
+                            job.catches = totalCatches;
+                            job.ore = oreCount;
+                            job.runningMs = runningMs;
+                            if (oreMessage) {
+                                job.pixels = attemptRarityFrame;
+                                job.w = collectSurface.width;
+                                job.h = collectSurface.height;
+                                job.itemCapture = true;
+                            } else if (attemptRarity == kRarityImpossible) {
+                                CaptureFullScreen(job.pixels, job.w, job.h);
+                            }
+                            EnqueueDiscord(std::move(job));
+                        }
                     }
+                    failStreak = 0;
+                    runningAtLastCatch = runningMs;
+                    failAlertSent = false;
                 }
                 else {
                     ++failedCollects;
+                    ++failStreak;
                     lastWasOre = false;
                 }
                 if (checking && gMinigameLog.load()) {
@@ -1972,6 +2296,19 @@ void SaveCurrentSession() {
     WriteSessions();
 }
 
+// Reset stats: the running session is saved to the Sessions list and a new,
+// empty session starts (the tracker zeroes its counters).
+void ResetStats() {
+    SaveCurrentSession();
+    int next = gCurrentSessionId;
+    for (const SessionRecord& r : gSessions) next = std::max(next, r.id);
+    gCurrentSessionId = next + 1;
+    gCurrentSessionStart = gEnabled.load() ? static_cast<long long>(time(nullptr)) : 0;
+    std::lock_guard<std::mutex> lock(gRestoreMutex);
+    gRestoreData = SessionRecord{};
+    gRestorePending = true;
+}
+
 // Continue a saved session: its numbers go back into the Fishing tab and it
 // keeps its number; saving later updates that same entry.
 void ContinueSession(int id) {
@@ -2068,6 +2405,9 @@ enum HitId {
     kHitBaitCal0 = 50,                   // calibration: kHitBaitCal0 + 0..6
     kHitSessRow0 = 60,                   // session list rows: kHitSessRow0 + 0..6
     kHitSessPrev = 70, kHitSessNext, kHitSessBack, kHitSessDelete, kHitRestoreYes, kHitRestoreNo,
+    kHitMenu = 80, kHitMenuItem0,            // menu items: kHitMenuItem0 + 0..7
+    kHitMenuBackdrop = 90, kHitResetStats, kHitDiscordToggle, kHitDiscordPing, kHitDiscordFail,
+    kHitDiscordTest, kHitDiscordChip0 = 100, // rarity/ORE chips: kHitDiscordChip0 + 0..5
 };
 struct HitRegion {
     RECT rect;
@@ -2380,6 +2720,19 @@ void DrawFishingTab(Gdiplus::Graphics& g, const Telemetry& t) {
                t.confidence, t.fps, t.mouseDown ? L"DOWN" : L"UP");
     Text(g, line, gFontSmall, ui::kMuted, RectF(92, 184, 258, 16));
 
+    {
+        // Reset stats (two clicks): saves this session and starts a new one.
+        const RectF reset(238, 140, 52, 22);
+        if (gResetArmed) {
+            Gdiplus::SolidBrush red(Gdiplus::Color(255, 190, 60, 70));
+            FillRound(g, red, reset, 11.0f);
+            HoverOverlay(g, reset, 11.0f, kHitResetStats);
+            TextCenter(g, L"Sure?", gFontLabel, ui::kText, reset);
+            AddHit(reset, kHitResetStats);
+        } else {
+            InsetButton(g, reset, L"Reset", kHitResetStats, ui::kSoft, 11.0f);
+        }
+    }
     const RectF pill(296, 140, 52, 22);
     if (t.enabled) {
         FillGradient(g, pill, 11.0f);
@@ -2444,7 +2797,7 @@ void DrawFishingTab(Gdiplus::Graphics& g, const Telemetry& t) {
         TextCenter(g, L"Calibrating · see the Setup tab (Esc cancels)", gFontSmall, ui::kWarn,
                    RectF(18, 578, 344, 18));
     } else {
-        swprintf_s(line, L"Session #%d  ·  %ls fishing  ·  v2.8", gCurrentSessionId,
+        swprintf_s(line, L"Session #%d  ·  %ls fishing  ·  v3.0", gCurrentSessionId,
                    FormatHoursMinutes(static_cast<long long>(t.runningMs)).c_str());
         TextCenter(g, line, gFontSmall, ui::kMuted, RectF(18, 578, 344, 18));
     }
@@ -2854,6 +3207,147 @@ void DrawSessionsTab(Gdiplus::Graphics& g) {
     }
 }
 
+// Tick box drawn at the start of a chip.
+void DrawCheckChip(Gdiplus::Graphics& g, const RectF& chip, const wchar_t* label, bool on,
+                   const Gdiplus::Color& dot, int id) {
+    FillInset(g, chip, 11.0f);
+    HoverOverlay(g, chip, 11.0f, id);
+    const RectF box(chip.X + 8, chip.Y + 5, 16, 16);
+    if (on) {
+        FillGradient(g, box, 4.0f);
+        Gdiplus::Pen tick(ui::kText, 2.0f);
+        g.DrawLine(&tick, box.X + 3.5f, box.Y + 8.5f, box.X + 6.8f, box.Y + 11.8f);
+        g.DrawLine(&tick, box.X + 6.8f, box.Y + 11.8f, box.X + 12.8f, box.Y + 4.8f);
+    } else {
+        Gdiplus::Pen outline(ui::kMuted, 1.3f);
+        Gdiplus::GraphicsPath path;
+        AddRoundRect(path, box, 4.0f);
+        g.DrawPath(&outline, &path);
+    }
+    Gdiplus::SolidBrush dotBrush(dot);
+    g.FillEllipse(&dotBrush, RectF(chip.X + 32, chip.Y + 9, 8, 8));
+    Text(g, label, gFontSmall, on ? ui::kText : ui::kMuted, RectF(chip.X + 46, chip.Y, chip.Width - 50, chip.Height));
+    AddHit(chip, id);
+}
+
+// Discord page. Its two EDIT controls sit on the inset boxes (see WM_CREATE).
+constexpr float kDiscordUrlY = 150.0f;
+constexpr float kDiscordMinRowY = 410.0f;
+
+void DrawDiscordTab(Gdiplus::Graphics& g) {
+    wchar_t line[128];
+    DrawCard(g, RectF(18, 128, 344, 100));
+    Text(g, L"DISCORD WEBHOOK", gFontLabel, ui::kText, RectF(34, 134, 200, 14));
+    Text(g, L"hidden", gFontSmall, ui::kMuted, RectF(200, 134, 146, 14), Gdiplus::StringAlignmentFar);
+    FillInset(g, RectF(34, kDiscordUrlY, 312, 30), 9.0f);
+    RowLabel(g, 184, L"Send messages", L"paste your channel's webhook link above");
+    DrawToggle(g, 184, gDiscordEnabled.load(), kHitDiscordToggle);
+
+    DrawCard(g, RectF(18, 238, 344, 124));
+    Text(g, L"NOTIFY ME FOR", gFontLabel, ui::kText, RectF(34, 246, 200, 14));
+    const wchar_t* names[6] = {L"Impossible", L"Mythic", L"ORE (+ picture)", L"Legendary", L"Rare", L"Common"};
+    const Gdiplus::Color dots[6] = {Gdiplus::Color(255, 20, 20, 26), Gdiplus::Color(255, 248, 82, 82),
+                                    ui::kGradA, Gdiplus::Color(255, 250, 190, 50),
+                                    Gdiplus::Color(255, 70, 150, 255), Gdiplus::Color(255, 165, 168, 185)};
+    const int rarityOf[6] = {kRarityImpossible, kRarityMythic, -1, kRarityLegendary, kRarityRare, kRarityCommon};
+    for (int i = 0; i < 6; ++i) {
+        const RectF chip(34.0f + (i % 2) * 158.0f, 266.0f + (i / 2) * 31.0f, 154.0f, 26.0f);
+        const bool on = rarityOf[i] < 0 ? gDiscordOre.load() : gDiscordRarity[rarityOf[i]].load();
+        DrawCheckChip(g, chip, names[i], on, dots[i], kHitDiscordChip0 + i);
+    }
+
+    DrawCard(g, RectF(18, 372, 344, 124));
+    RowLabel(g, 376, L"Failing to fish alert", L"3 fails in a row, with a screenshot");
+    DrawToggle(g, 376, gDiscordFailAlerts.load(), kHitDiscordFail);
+    Divider(g, kDiscordMinRowY - 3);
+    RowLabel(g, kDiscordMinRowY, L"No catch for", L"minutes of fishing = failing too (0 = off)");
+    FillInset(g, RectF(266, kDiscordMinRowY + 5, 80, 30), 9.0f);
+    Divider(g, 453);
+    RowLabel(g, 456, L"Ping @everyone", L"in every message");
+    DrawToggle(g, 456, gDiscordPing.load(), kHitDiscordPing);
+
+    GradientButton(g, RectF(18, 506, 150, 40), L"Send test", kHitDiscordTest, 12.0f);
+    const int status = gDiscordLastStatus.load();
+    if (GetDiscordUrl().empty()) {
+        swprintf_s(line, L"No webhook link yet");
+    } else if (status == 0) {
+        swprintf_s(line, gDiscordEnabled.load() ? L"Ready" : L"Off");
+    } else if (status >= 200 && status < 300) {
+        const time_t tt = static_cast<time_t>(gDiscordLastTime.load());
+        tm local{};
+        localtime_s(&local, &tt);
+        swprintf_s(line, L"Last message sent ✓ %02d:%02d", local.tm_hour, local.tm_min);
+    } else if (status < 0) {
+        swprintf_s(line, L"Could not reach Discord");
+    } else {
+        swprintf_s(line, L"Discord error %d (check the link)", status);
+    }
+    const bool bad = status < 0 || status >= 300;
+    Text(g, line, gFontSmall, bad && status != 0 ? ui::kBad : ui::kSoft, RectF(178, 506, 184, 40));
+}
+
+// Credits page.
+void DrawCreditsTab(Gdiplus::Graphics& g) {
+    DrawCard(g, RectF(18, 128, 344, 460));
+    if (gCloudIcon) {
+        g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+        g.DrawImage(gCloudIcon, RectF(80, 150, 220, 162)); // 312x230 logo
+    }
+    TextCenter(g, L"Sky's S2 Fishing Macro", gFontHead, ui::kText, RectF(18, 324, 344, 26));
+    TextCenter(g, L"MADE BY", gFontLabel, ui::kMuted, RectF(18, 364, 344, 16));
+    {
+        // "Sky" in the gradient, with a small trademark sign.
+        Gdiplus::Font big(L"Segoe UI", 54.0f, Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
+        Gdiplus::StringFormat format;
+        format.SetAlignment(Gdiplus::StringAlignmentCenter);
+        format.SetLineAlignment(Gdiplus::StringAlignmentCenter);
+        const RectF area(18, 378, 344, 72);
+        Gdiplus::LinearGradientBrush brush(RectF(130, 380, 120, 70), ui::kGradA, ui::kGradB,
+                                           Gdiplus::LinearGradientModeHorizontal);
+        g.DrawString(L"Sky", -1, &big, area, &format, &brush);
+        Gdiplus::RectF bounds;
+        g.MeasureString(L"Sky", -1, &big, area, &format, &bounds);
+        Text(g, L"™", gFontButton, ui::kSoft, RectF(bounds.X + bounds.Width - 4, 390, 24, 18));
+    }
+    Divider(g, 462);
+    TextCenter(g, L"Version 3.0  ·  Project Slayers 2 auto fishing", gFontSmall, ui::kMuted,
+               RectF(18, 470, 344, 18));
+    TextCenter(g, L"Special thanks: midnytejay (original Fishing Hyper Tracker)", gFontSmall, ui::kMuted,
+               RectF(18, 492, 344, 18));
+    TextCenter(g, L"© 2026 Sky", gFontLabel, ui::kSoft, RectF(18, 548, 344, 20));
+}
+
+// Burger menu: pages in menu order -> page index used by gActiveTab.
+const wchar_t* const kPageNames[8] = {L"Fishing", L"Settings", L"Hotkeys", L"Setup",
+                                      L"Auto Bait", L"Sessions", L"Discord", L"Credits"};
+const int kMenuOrder[8] = {0, 5, 1, 2, 3, 4, 6, 7};
+
+void DrawMenu(Gdiplus::Graphics& g) {
+    Gdiplus::SolidBrush dim(Gdiplus::Color(140, 18, 19, 36));
+    g.FillRectangle(&dim, RectF(0, 114, static_cast<float>(ui::kWidth), static_cast<float>(ui::kHeight) - 114));
+    const RectF card(22, 118, 210, 8 * 38 + 10);
+    DrawCard(g, card, 14.0f);
+    std::vector<HitRegion> hits;
+    for (int k = 0; k < 8; ++k) {
+        const int page = kMenuOrder[k];
+        const RectF item(28, 123.0f + k * 38.0f, 198, 34);
+        const int id = kHitMenuItem0 + k;
+        if (gActiveTab == page) FillGradient(g, item, 10.0f);
+        else HoverOverlay(g, item, 10.0f, id);
+        Text(g, kPageNames[page], gFontButton, gActiveTab == page ? ui::kText : ui::kSoft,
+             RectF(item.X + 14, item.Y, item.Width - 20, item.Height));
+        hits.push_back({RECT{static_cast<LONG>(item.X), static_cast<LONG>(item.Y),
+                             static_cast<LONG>(item.X + item.Width), static_cast<LONG>(item.Y + item.Height)}, id});
+    }
+    // Menu items and the burger come first, then a backdrop that closes the
+    // menu; the page underneath gets no clicks while the menu is open.
+    for (const HitRegion& h : gHits) {
+        if (h.id == kHitMenu || h.id == kHitClose || h.id == kHitMinimize) hits.push_back(h);
+    }
+    hits.push_back({RECT{0, 72, ui::kWidth, ui::kHeight}, kHitMenuBackdrop});
+    gHits = hits;
+}
+
 void PaintHud(HWND hwnd) {
     PAINTSTRUCT ps{};
     HDC windowDc = BeginPaint(hwnd, &ps);
@@ -2879,14 +3373,13 @@ void PaintHud(HWND hwnd) {
         g.SetTextRenderingHint(Gdiplus::TextRenderingHintClearTypeGridFit);
         g.Clear(ui::kBg);
 
-        // Header: gradient logo with the fish icon, title, close button.
-        FillGradient(g, RectF(18, 16, 40, 40), 20.0f);
-        if (Gdiplus::Bitmap* icon = t.enabled ? gFishOnIcon : gFishOffIcon) {
+        // Header: cloud logo, title, minimize/close.
+        if (gCloudIcon) {
             g.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
-            g.DrawImage(icon, RectF(25, 23, 26, 26));
+            g.DrawImage(gCloudIcon, RectF(14, 18, 48, 35)); // 312x230 logo
         }
         Text(g, L"Sky's S2 Fishing Macro", gFontTitle, ui::kText, RectF(68, 15, 250, 24));
-        Text(g, L"Project Slayers 2  ·  auto fishing", gFontSmall, ui::kMuted, RectF(68, 38, 250, 16));
+        Text(g, L"Project Slayers 2  ·  by Sky", gFontSmall, ui::kMuted, RectF(68, 38, 250, 16));
         const RectF closeR(static_cast<float>(client.right) - 46.0f, 22.0f, 28.0f, 28.0f);
         HoverOverlay(g, closeR, 9.0f, kHitClose);
         TextCenter(g, L"✕", gFontBody, gHoverHit == kHitClose ? ui::kText : ui::kMuted, closeR);
@@ -2899,16 +3392,21 @@ void PaintHud(HWND hwnd) {
         }
         AddHit(minR, kHitMinimize);
 
-        // Segmented tab bar.
+        // Burger menu bar: the button plus the name of the current page.
         DrawCard(g, RectF(18, 72, 344, 42));
-        const wchar_t* tabs[6] = {L"Fishing", L"Settings", L"Hotkeys", L"Setup", L"Bait", L"Sessions"};
-        for (int i = 0; i < 6; ++i) {
-            const RectF seg(22.0f + i * 56.0f, 76.0f, 56.0f, 34.0f);
-            const int id = kHitTab0 + i;
-            if (gActiveTab == i) FillGradient(g, seg, 11.0f);
-            else HoverOverlay(g, seg, 11.0f, id);
-            TextCenter(g, tabs[i], gFontTab, gActiveTab == i ? ui::kText : ui::kMuted, seg);
-            AddHit(seg, id);
+        {
+            const RectF burger(22, 76, 42, 34);
+            if (gMenuOpen) FillGradient(g, burger, 10.0f);
+            else HoverOverlay(g, burger, 10.0f, kHitMenu);
+            Gdiplus::Pen bars(ui::kText, 2.2f);
+            bars.SetStartCap(Gdiplus::LineCapRound);
+            bars.SetEndCap(Gdiplus::LineCapRound);
+            for (int i = 0; i < 3; ++i) {
+                const float y = 86.0f + i * 7.0f;
+                g.DrawLine(&bars, 34.0f, y, 52.0f, y);
+            }
+            AddHit(burger, kHitMenu);
+            Text(g, kPageNames[std::clamp(gActiveTab, 0, 7)], gFontButton, ui::kText, RectF(74, 76, 200, 34));
         }
 
         if (gActiveTab == 0) DrawFishingTab(g, t);
@@ -2916,8 +3414,11 @@ void PaintHud(HWND hwnd) {
         else if (gActiveTab == 2) DrawHotkeysTab(g);
         else if (gActiveTab == 3) DrawSetupTab(g);
         else if (gActiveTab == 4) DrawBaitTab(g);
-        else DrawSessionsTab(g);
+        else if (gActiveTab == 5) DrawSessionsTab(g);
+        else if (gActiveTab == 6) DrawDiscordTab(g);
+        else DrawCreditsTab(g);
         if (gActiveTab == 0 && gRestorePromptId >= 0) DrawRestorePrompt(g);
+        if (gMenuOpen) DrawMenu(g);
     }
 
     BitBlt(windowDc, 0, 0, client.right, client.bottom, dc, 0, 0, SRCCOPY);
@@ -3171,6 +3672,25 @@ void LoadSettings() {
             SetBaitPoint(i, POINT{ReadIntSetting(L"Bait", kx, 0, path), ReadIntSetting(L"Bait", ky, 0, path)});
         }
     }
+    {
+        wchar_t url[1024] = {};
+        GetPrivateProfileStringW(L"Discord", L"WebhookUrl", L"", url, 1024, path.c_str());
+        {
+            std::lock_guard<std::mutex> lock(gDiscordUrlMutex);
+            gDiscordUrl = url;
+        }
+        gDiscordEnabled.store(ReadIntSetting(L"Discord", L"Enabled", 0, path) != 0);
+        gDiscordPing.store(ReadIntSetting(L"Discord", L"Ping", 0, path) != 0);
+        gDiscordFailAlerts.store(ReadIntSetting(L"Discord", L"FailAlerts", 1, path) != 0);
+        gDiscordOre.store(ReadIntSetting(L"Discord", L"Ore", 1, path) != 0);
+        gDiscordNoCatchMin.store(std::clamp(ReadIntSetting(L"Discord", L"NoCatchMinutes", 10, path), 0, 999));
+        const int defaults[5] = {1, 1, 1, 0, 0};
+        for (int i = 0; i < 5; ++i) {
+            wchar_t key[16];
+            swprintf_s(key, L"Rarity%d", i);
+            gDiscordRarity[i].store(ReadIntSetting(L"Discord", key, defaults[i], path) != 0);
+        }
+    }
     const UINT correctionVk = GetPrivateProfileIntW(L"Keys", L"CorrectionVk", '1', path.c_str());
     const UINT rodVk = GetPrivateProfileIntW(L"Keys", L"RodVk", '5', path.c_str());
     if (correctionVk > 0 && correctionVk <= 0xFF) gCorrectionKeyVk.store(static_cast<WORD>(correctionVk));
@@ -3232,6 +3752,17 @@ void SaveSettings() {
         WriteIntSetting(L"Bait", ky, bp.y, path);
     }
     WriteIntSetting(L"Debug", L"MinigameLog", gMinigameLog.load() ? 1 : 0, path);
+    WritePrivateProfileStringW(L"Discord", L"WebhookUrl", GetDiscordUrl().c_str(), path.c_str());
+    WriteIntSetting(L"Discord", L"Enabled", gDiscordEnabled.load() ? 1 : 0, path);
+    WriteIntSetting(L"Discord", L"Ping", gDiscordPing.load() ? 1 : 0, path);
+    WriteIntSetting(L"Discord", L"FailAlerts", gDiscordFailAlerts.load() ? 1 : 0, path);
+    WriteIntSetting(L"Discord", L"Ore", gDiscordOre.load() ? 1 : 0, path);
+    WriteIntSetting(L"Discord", L"NoCatchMinutes", gDiscordNoCatchMin.load(), path);
+    for (int i = 0; i < 5; ++i) {
+        wchar_t key[16];
+        swprintf_s(key, L"Rarity%d", i);
+        WriteIntSetting(L"Discord", key, gDiscordRarity[i].load() ? 1 : 0, path);
+    }
     WriteIntSetting(L"Keys", L"CorrectionVk", gCorrectionKeyVk.load(), path);
     WriteIntSetting(L"Keys", L"RodVk", gRodKeyVk.load(), path);
 
@@ -3324,8 +3855,13 @@ void EndHotkeyBind() {
 
 void SetActiveTab(int tab) {
     gActiveTab = tab;
-    const int show = (tab == 1) ? SW_SHOW : SW_HIDE;
-    const int showBait = (tab == 4) ? SW_SHOW : SW_HIDE;
+    // Edit controls are real child windows: hide them all while the menu is
+    // open so they don't show through it.
+    const int show = (tab == 1 && !gMenuOpen) ? SW_SHOW : SW_HIDE;
+    const int showBait = (tab == 4 && !gMenuOpen) ? SW_SHOW : SW_HIDE;
+    const int showDiscord = (tab == 6 && !gMenuOpen) ? SW_SHOW : SW_HIDE;
+    if (gDiscordUrlEdit) ShowWindow(gDiscordUrlEdit, showDiscord);
+    if (gDiscordMinEdit) ShowWindow(gDiscordMinEdit, showDiscord);
     if (gBaitAmountEdit) ShowWindow(gBaitAmountEdit, showBait);
     if (gBaitDelayEdit) ShowWindow(gBaitDelayEdit, showBait);
     if (gHoldKeyEdit) ShowWindow(gHoldKeyEdit, show);
@@ -3432,7 +3968,73 @@ void UpdateRespawnEverySetting() {
 }
 
 void HandleHit(HWND hwnd, int id) {
+    if (id != kHitResetStats) gResetArmed = false;
     switch (id) {
+        case kHitMenu:
+            gMenuOpen = !gMenuOpen;
+            SetActiveTab(gActiveTab);
+            break;
+        case kHitMenuBackdrop:
+            gMenuOpen = false;
+            SetActiveTab(gActiveTab);
+            break;
+        case kHitMenuItem0: case kHitMenuItem0 + 1: case kHitMenuItem0 + 2: case kHitMenuItem0 + 3:
+        case kHitMenuItem0 + 4: case kHitMenuItem0 + 5: case kHitMenuItem0 + 6: case kHitMenuItem0 + 7: {
+            const int page = kMenuOrder[id - kHitMenuItem0];
+            gMenuOpen = false;
+            gSessionDeleteArmed = false;
+            if (page == 5 && gActiveTab == 5) gSessionOpenId = -1; // Sessions again = back to the list
+            SetActiveTab(page);
+            break;
+        }
+        case kHitResetStats:
+            if (gResetArmed) {
+                ResetStats();
+                gResetArmed = false;
+            } else {
+                gResetArmed = true;
+            }
+            break;
+        case kHitDiscordToggle:
+            gDiscordEnabled.store(!gDiscordEnabled.load());
+            SaveSettings();
+            break;
+        case kHitDiscordPing:
+            gDiscordPing.store(!gDiscordPing.load());
+            SaveSettings();
+            break;
+        case kHitDiscordFail:
+            gDiscordFailAlerts.store(!gDiscordFailAlerts.load());
+            SaveSettings();
+            break;
+        case kHitDiscordChip0: case kHitDiscordChip0 + 1: case kHitDiscordChip0 + 2:
+        case kHitDiscordChip0 + 3: case kHitDiscordChip0 + 4: case kHitDiscordChip0 + 5: {
+            const int rarityOf[6] = {kRarityImpossible, kRarityMythic, -1, kRarityLegendary, kRarityRare, kRarityCommon};
+            const int r = rarityOf[id - kHitDiscordChip0];
+            if (r < 0) gDiscordOre.store(!gDiscordOre.load());
+            else gDiscordRarity[r].store(!gDiscordRarity[r].load());
+            SaveSettings();
+            break;
+        }
+        case kHitDiscordTest: {
+            SetFocus(hwnd); // commit a link that is still being typed
+            DiscordJob job;
+            job.type = DiscordEvent::Test;
+            Telemetry t;
+            {
+                std::lock_guard<std::mutex> lock(gTelemetryMutex);
+                t = gTelemetry;
+            }
+            job.sessionId = gCurrentSessionId;
+            job.catches = t.totalCatches;
+            job.ore = t.oreCount;
+            job.runningMs = t.runningMs;
+            CaptureFullScreen(job.pixels, job.w, job.h);
+            const bool wasEnabled = gDiscordEnabled.exchange(true); // a test always sends
+            EnqueueDiscord(std::move(job));
+            gDiscordEnabled.store(wasEnabled);
+            break;
+        }
         case kHitTab0: case kHitTab1: case kHitTab2: case kHitTab3: case kHitTab4: case kHitTab5:
             gSessionDeleteArmed = false;
             if (id == kHitTab5 && gActiveTab == 5) gSessionOpenId = -1; // tab click again = back to list
@@ -3571,6 +4173,19 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             SendMessage(gHoldKeyEdit, EM_SETLIMITTEXT, 4, 0);
             gRespawnEdit = CreateNumberEdit(hwnd, ID_RESPAWN_EDIT, 272, editY(4));
             gBaitAmountEdit = CreateNumberEdit(hwnd, ID_BAIT_AMOUNT_EDIT, 272, static_cast<int>(kBaitAmountRowY) + 9);
+            // Discord: webhook link (masked - it works like a password) and minutes.
+            gDiscordUrlEdit = CreateWindowEx(0, L"EDIT", L"",
+                WS_CHILD | ES_AUTOHSCROLL | ES_PASSWORD, 42, static_cast<int>(kDiscordUrlY) + 7, 296, 18, hwnd,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_DISCORD_URL_EDIT)), nullptr, nullptr);
+            SendMessage(gDiscordUrlEdit, WM_SETFONT, reinterpret_cast<WPARAM>(gSmallEditFont), TRUE);
+            SendMessage(gDiscordUrlEdit, EM_SETLIMITTEXT, 1000, 0);
+            SetWindowTextW(gDiscordUrlEdit, GetDiscordUrl().c_str());
+            gDiscordMinEdit = CreateNumberEdit(hwnd, ID_DISCORD_MIN_EDIT, 272, static_cast<int>(kDiscordMinRowY) + 9);
+            {
+                wchar_t minutes[16];
+                swprintf_s(minutes, L"%d", gDiscordNoCatchMin.load());
+                SetWindowTextW(gDiscordMinEdit, minutes);
+            }
             gBaitDelayEdit = CreateNumberEdit(hwnd, ID_BAIT_DELAY_EDIT, 272, static_cast<int>(kBaitDelayRowY) + 9);
             SendMessage(gBaitAmountEdit, EM_SETLIMITTEXT, 5, 0);
             SendMessage(gBaitDelayEdit, EM_SETLIMITTEXT, 4, 0);
@@ -3597,6 +4212,27 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             if (LOWORD(wParam) == ID_WAIT_FISH_EDIT && HIWORD(wParam) == EN_KILLFOCUS) {
                 UpdateWaitForFishSetting();
                 InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            if (LOWORD(wParam) == ID_DISCORD_URL_EDIT && HIWORD(wParam) == EN_KILLFOCUS) {
+                wchar_t url[1024] = {};
+                GetWindowTextW(gDiscordUrlEdit, url, 1024);
+                std::wstring text(url);
+                while (!text.empty() && iswspace(text.back())) text.pop_back();
+                while (!text.empty() && iswspace(text.front())) text.erase(text.begin());
+                {
+                    std::lock_guard<std::mutex> lock(gDiscordUrlMutex);
+                    gDiscordUrl = text;
+                }
+                SaveSettings();
+                InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            if (LOWORD(wParam) == ID_DISCORD_MIN_EDIT && HIWORD(wParam) == EN_KILLFOCUS) {
+                wchar_t buf[16] = {};
+                GetWindowTextW(gDiscordMinEdit, buf, 16);
+                gDiscordNoCatchMin.store(std::clamp(_wtoi(buf), 0, 999));
+                swprintf_s(buf, L"%d", gDiscordNoCatchMin.load());
+                SetWindowTextW(gDiscordMinEdit, buf);
+                SaveSettings();
             }
             if (LOWORD(wParam) == ID_BAIT_AMOUNT_EDIT && HIWORD(wParam) == EN_KILLFOCUS) {
                 UpdateBaitAmountSetting();
@@ -3750,13 +4386,15 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
 
     Gdiplus::GdiplusStartupInput gdiplusStartupInput;
     Gdiplus::GdiplusStartup(&gGdiplusToken, &gdiplusStartupInput, nullptr);
-    gFishOnIcon = LoadPngFromMemory(kFishOnPng, kFishOnPngSize);
-    gFishOffIcon = LoadPngFromMemory(kFishOffPng, kFishOffPngSize);
+    gCloudIcon = LoadPngFromMemory(kCloudPng, kCloudPngSize);
     gWenIcon = LoadPngFromMemory(kWenPng, kWenPngSize);
     CreateUiFonts();
 
     gBackgroundBrush = CreateSolidBrush(ui::kBgRef);
     gInputBrush = CreateSolidBrush(ui::kInsetRef);
+    gSmallEditFont = CreateFont(-13, 0, 0, 0, FW_NORMAL, FALSE, FALSE, FALSE,
+                                DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
+                                CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
     gUiFont = CreateFont(-17, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
                          DEFAULT_CHARSET, OUT_DEFAULT_PRECIS, CLIP_DEFAULT_PRECIS,
                          CLEARTYPE_QUALITY, DEFAULT_PITCH, L"Segoe UI");
@@ -3784,7 +4422,18 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     SetWindowRgn(gWindow, CreateRoundRectRgn(0, 0, ui::kWidth + 1, ui::kHeight + 1, 26, 26), TRUE);
 
     HICON appIcon = nullptr;
-    if (gFishOnIcon && gFishOnIcon->GetHICON(&appIcon) == Gdiplus::Ok && appIcon) {
+    if (gCloudIcon) {
+        // Square app icon with the cloud centred (the logo itself is 312x230).
+        Gdiplus::Bitmap square(256, 256, PixelFormat32bppARGB);
+        {
+            Gdiplus::Graphics ig(&square);
+            ig.Clear(Gdiplus::Color(0, 0, 0, 0));
+            ig.SetInterpolationMode(Gdiplus::InterpolationModeHighQualityBicubic);
+            ig.DrawImage(gCloudIcon, Gdiplus::RectF(0, 34, 256, 189));
+        }
+        square.GetHICON(&appIcon);
+    }
+    if (appIcon) {
         SendMessage(gWindow, WM_SETICON, ICON_BIG, reinterpret_cast<LPARAM>(appIcon));
         SendMessage(gWindow, WM_SETICON, ICON_SMALL, reinterpret_cast<LPARAM>(appIcon));
     }
@@ -3815,6 +4464,8 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     UpdateWindow(gWindow);
 
     HANDLE thread = CreateThread(nullptr, 0, TrackerThread, nullptr, 0, nullptr);
+    gDiscordWake = CreateEvent(nullptr, FALSE, FALSE, nullptr);
+    if (HANDLE discord = CreateThread(nullptr, 0, DiscordThread, nullptr, 0, nullptr)) CloseHandle(discord);
     MSG msg{};
     while (GetMessage(&msg, nullptr, 0, 0) > 0) {
         TranslateMessage(&msg);
@@ -3833,17 +4484,16 @@ int WINAPI wWinMain(HINSTANCE instance, HINSTANCE, PWSTR, int showCommand) {
     UnregisterHotKey(gWindow, HOTKEY_BAIT);
     UnregisterHotKey(gWindow, HOTKEY_QUIT);
     DeleteObject(gUiFont);
+    DeleteObject(gSmallEditFont);
     DeleteObject(gBackgroundBrush);
     DeleteObject(gInputBrush);
     if (appIcon) DestroyIcon(appIcon);
     // GDI+ objects must be destroyed before GdiplusShutdown.
     DestroyUiFonts();
-    delete gFishOnIcon;
-    gFishOnIcon = nullptr;
-    delete gFishOffIcon;
+    delete gCloudIcon;
+    gCloudIcon = nullptr;
     delete gWenIcon;
     gWenIcon = nullptr;
-    gFishOffIcon = nullptr;
     Gdiplus::GdiplusShutdown(gGdiplusToken);
     return 0;
 }

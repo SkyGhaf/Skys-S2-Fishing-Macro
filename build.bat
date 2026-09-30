@@ -12,11 +12,11 @@ pause
 exit /b 1
 
 :mingw
-g++ -std=c++17 -O3 -s -mwindows -static -municode main.cpp -o SkysS2FishingMacro.exe -lgdi32 -ldwmapi -lwinmm -lcomctl32 -lgdiplus -lole32
+g++ -std=c++17 -O3 -s -mwindows -static -municode main.cpp -o SkysS2FishingMacro.exe -lgdi32 -ldwmapi -lwinmm -lcomctl32 -lgdiplus -lole32 -lwinhttp
 goto :done
 
 :msvc
-cl /nologo /std:c++17 /O2 /EHsc /DUNICODE /D_UNICODE main.cpp /link /SUBSYSTEM:WINDOWS /OUT:SkysS2FishingMacro.exe user32.lib gdi32.lib dwmapi.lib winmm.lib comctl32.lib gdiplus.lib ole32.lib
+cl /nologo /std:c++17 /O2 /EHsc /DUNICODE /D_UNICODE main.cpp /link /SUBSYSTEM:WINDOWS /OUT:SkysS2FishingMacro.exe user32.lib gdi32.lib dwmapi.lib winmm.lib comctl32.lib gdiplus.lib ole32.lib winhttp.lib
 
 :done
 if errorlevel 1 (
