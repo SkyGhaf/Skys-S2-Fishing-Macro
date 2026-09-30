@@ -56,6 +56,7 @@ constexpr int ID_BAIT_AMOUNT_EDIT = 1014;
 constexpr int ID_BAIT_DELAY_EDIT = 1015;
 constexpr int ID_DISCORD_URL_EDIT = 1016;
 constexpr int ID_DISCORD_MIN_EDIT = 1017;
+constexpr int ID_DISCORD_PING_EDIT = 1018;
 constexpr int HOTKEY_TOGGLE = 1;
 constexpr int HOTKEY_QUIT = 2;
 constexpr int HOTKEY_BAIT = 4; // Auto Bait start/stop
@@ -354,6 +355,7 @@ std::atomic<bool> gBaitFocusLost{false};       // last run stopped: game not in 
 HWND gBaitAmountEdit = nullptr;
 HWND gDiscordUrlEdit = nullptr;
 HWND gDiscordMinEdit = nullptr;
+HWND gDiscordPingEdit = nullptr;
 HFONT gSmallEditFont = nullptr;
 bool gMenuOpen = false;        // burger menu (UI thread)
 bool gResetArmed = false;      // "Reset stats" needs a second click
@@ -1171,6 +1173,8 @@ std::mutex gDiscordUrlMutex;
 std::wstring gDiscordUrl;
 std::atomic<bool> gDiscordEnabled{false};
 std::atomic<bool> gDiscordPing{false};
+std::atomic<bool> gDiscordHideUrl{false};    // show the webhook link as dots
+std::wstring gDiscordPingWho;               // "" / "everyone" = @everyone, digits = one user ID (gDiscordUrlMutex)
 std::atomic<bool> gDiscordFailAlerts{true};
 std::atomic<bool> gDiscordOre{true};
 std::atomic<bool> gDiscordRarity[5] = {{true}, {true}, {true}, {false}, {false}}; // Impossible..Common
@@ -1181,6 +1185,11 @@ std::atomic<long long> gDiscordLastTime{0};
 std::wstring GetDiscordUrl() {
     std::lock_guard<std::mutex> lock(gDiscordUrlMutex);
     return gDiscordUrl;
+}
+
+std::wstring GetDiscordPingWho() {
+    std::lock_guard<std::mutex> lock(gDiscordUrlMutex);
+    return gDiscordPingWho;
 }
 
 void EnqueueDiscord(DiscordJob&& job) {
@@ -1245,6 +1254,7 @@ bool MakeDiscordPng(const DiscordJob& job, std::vector<unsigned char>& png) {
                            reinterpret_cast<BYTE*>(const_cast<uint32_t*>(job.pixels.data())));
     const int scale = job.itemCapture ? 2 : 1;
     const int band = job.itemCapture ? 64 : 0;
+    const bool ore = job.type == DiscordEvent::Ore;
     const int outW = job.w * scale, outH = job.h * scale + band;
     Gdiplus::Bitmap canvas(outW, outH, PixelFormat32bppARGB);
     {
@@ -1252,7 +1262,7 @@ bool MakeDiscordPng(const DiscordJob& job, std::vector<unsigned char>& png) {
         g.SetInterpolationMode(job.itemCapture ? Gdiplus::InterpolationModeHighQualityBicubic
                                                : Gdiplus::InterpolationModeNearestNeighbor);
         g.SetSmoothingMode(Gdiplus::SmoothingModeAntiAlias);
-        g.Clear(Gdiplus::Color(255, 40, 41, 70));
+        g.Clear(ore ? Gdiplus::Color(255, 200, 28, 36) : Gdiplus::Color(255, 40, 41, 70)); // red band for ORE
         g.DrawImage(&source, Gdiplus::RectF(0, static_cast<float>(band), static_cast<float>(outW),
                                    static_cast<float>(job.h * scale)));
         if (gCloudIcon) {
@@ -1260,7 +1270,8 @@ bool MakeDiscordPng(const DiscordJob& job, std::vector<unsigned char>& png) {
                 g.DrawImage(gCloudIcon, Gdiplus::RectF(12, 8, 65, 48));
                 Gdiplus::Font font(L"Segoe UI", 20.0f, Gdiplus::FontStyleBold, Gdiplus::UnitPixel);
                 Gdiplus::SolidBrush white(Gdiplus::Color(255, 240, 242, 255));
-                g.DrawString(L"Sky's S2 Fishing Macro", -1, &font, Gdiplus::PointF(88, 18), &white);
+                g.DrawString(ore ? L"ORE caught!  \u00B7  Sky's S2 Fishing Macro" : L"Sky's S2 Fishing Macro", -1,
+                             &font, Gdiplus::PointF(88, 18), &white);
             } else {
                 const float cw = std::max(80.0f, outW * 0.06f);
                 g.DrawImage(gCloudIcon, Gdiplus::RectF(outW * 0.01f, outH * 0.065f, cw, cw * 230.0f / 312.0f));
@@ -1342,15 +1353,21 @@ std::string DiscordJson(const DiscordJob& job, bool hasImage) {
     int colour = 0x2D6CFF;
     switch (job.type) {
         case DiscordEvent::Ore:
-            title = "\xE2\x9B\x8F\xEF\xB8\x8F ORE caught!";
-            description = "Everyone's favourite drop just landed.";
-            colour = 0x00E5A0;
+            // Red theme: an ORE must stand out immediately.
+            title = "\xF0\x9F\x9F\xA5 ORE CAUGHT! \xE2\x9B\x8F\xEF\xB8\x8F";
+            description = "\xF0\x9F\x94\xB4 Everyone's favourite drop just landed.";
+            colour = 0xE02424;
             break;
         case DiscordEvent::Item:
             if (job.rarity >= 0 && job.rarity < 5) {
                 title = std::string(rarityNames[job.rarity]) + " catch!";
                 colour = rarityColours[job.rarity];
-                if (job.rarity == 0) description = "\xF0\x9F\x8E\x89 An IMPOSSIBLE item - the rarest there is!";
+                if (job.rarity == 0) {
+                    // Black theme for the rarest drop.
+                    title = "\xE2\xAC\x9B IMPOSSIBLE CATCH! \xE2\xAC\x9B";
+                    description = "\xF0\x9F\x96\xA4 The rarest drop there is.";
+                    colour = 0x010101; // 0 would mean "no colour" to Discord
+                }
             }
             break;
         case DiscordEvent::Failing:
@@ -1372,10 +1389,26 @@ std::string DiscordJson(const DiscordJob& job, bool hasImage) {
              "{\"name\":\"ORE\",\"value\":\"%d (%.1f/h)\",\"inline\":true},"
              "{\"name\":\"Time fished\",\"value\":\"%lldh %02lldm\",\"inline\":true}]",
              job.sessionId, job.catches, job.ore, hours > 0.016 ? job.ore / hours : 0.0, minutes / 60, minutes % 60);
-    const bool ping = gDiscordPing.load();
+    // Ping: @everyone by default; digits = one user's ID (a real ping); any
+    // other text is only shown, because webhooks can't ping by name.
+    std::string content, mentions = "{\"parse\":[]}";
+    if (gDiscordPing.load()) {
+        std::string who = ToUtf8(GetDiscordPingWho());
+        if (!who.empty() && who[0] == '@') who.erase(0, 1);
+        const bool digits = !who.empty() && who.find_first_not_of("0123456789") == std::string::npos;
+        if (who.empty() || who == "everyone") {
+            content = "@everyone";
+            mentions = "{\"parse\":[\"everyone\"]}";
+        } else if (digits) {
+            content = "<@" + who + ">";
+            mentions = "{\"users\":[\"" + who + "\"]}";
+        } else {
+            content = "@" + JsonEscape(who);
+        }
+    }
     std::string json = "{\"username\":\"Sky's S2 Fishing Macro\",";
-    json += "\"content\":\"" + std::string(ping ? "@everyone" : "") + "\",";
-    json += std::string("\"allowed_mentions\":{\"parse\":[") + (ping ? "\"everyone\"" : "") + "]},";
+    json += "\"content\":\"" + content + "\",";
+    json += "\"allowed_mentions\":" + mentions + ",";
     json += "\"embeds\":[{\"title\":\"" + JsonEscape(title) + "\",";
     if (!description.empty()) json += "\"description\":\"" + JsonEscape(description) + "\",";
     json += "\"color\":" + std::to_string(colour) + ",\"fields\":" + fields + ",";
@@ -2408,6 +2441,7 @@ enum HitId {
     kHitMenu = 80, kHitMenuItem0,            // menu items: kHitMenuItem0 + 0..7
     kHitMenuBackdrop = 90, kHitResetStats, kHitDiscordToggle, kHitDiscordPing, kHitDiscordFail,
     kHitDiscordTest, kHitDiscordChip0 = 100, // rarity/ORE chips: kHitDiscordChip0 + 0..5
+    kHitDiscordHide = 110,
 };
 struct HitRegion {
     RECT rect;
@@ -3233,21 +3267,23 @@ void DrawCheckChip(Gdiplus::Graphics& g, const RectF& chip, const wchar_t* label
 // Discord page. Its two EDIT controls sit on the inset boxes (see WM_CREATE).
 constexpr float kDiscordUrlY = 150.0f;
 constexpr float kDiscordMinRowY = 410.0f;
+constexpr float kDiscordPingRowY = 499.0f;
 
 void DrawDiscordTab(Gdiplus::Graphics& g) {
     wchar_t line[128];
     DrawCard(g, RectF(18, 128, 344, 100));
     Text(g, L"DISCORD WEBHOOK", gFontLabel, ui::kText, RectF(34, 134, 200, 14));
-    Text(g, L"hidden", gFontSmall, ui::kMuted, RectF(200, 134, 146, 14), Gdiplus::StringAlignmentFar);
+    InsetButton(g, RectF(282, 131, 64, 17), gDiscordHideUrl.load() ? L"Show" : L"Hide", kHitDiscordHide,
+                ui::kSoft, 8.0f);
     FillInset(g, RectF(34, kDiscordUrlY, 312, 30), 9.0f);
     RowLabel(g, 184, L"Send messages", L"paste your channel's webhook link above");
     DrawToggle(g, 184, gDiscordEnabled.load(), kHitDiscordToggle);
 
     DrawCard(g, RectF(18, 238, 344, 124));
     Text(g, L"NOTIFY ME FOR", gFontLabel, ui::kText, RectF(34, 246, 200, 14));
-    const wchar_t* names[6] = {L"Impossible", L"Mythic", L"ORE (+ picture)", L"Legendary", L"Rare", L"Common"};
+    const wchar_t* names[6] = {L"Impossible (+ pic)", L"Mythic", L"ORE (+ pic)", L"Legendary", L"Rare", L"Common"};
     const Gdiplus::Color dots[6] = {Gdiplus::Color(255, 20, 20, 26), Gdiplus::Color(255, 248, 82, 82),
-                                    ui::kGradA, Gdiplus::Color(255, 250, 190, 50),
+                                    Gdiplus::Color(255, 224, 36, 36), Gdiplus::Color(255, 250, 190, 50),
                                     Gdiplus::Color(255, 70, 150, 255), Gdiplus::Color(255, 165, 168, 185)};
     const int rarityOf[6] = {kRarityImpossible, kRarityMythic, -1, kRarityLegendary, kRarityRare, kRarityCommon};
     for (int i = 0; i < 6; ++i) {
@@ -3256,17 +3292,20 @@ void DrawDiscordTab(Gdiplus::Graphics& g) {
         DrawCheckChip(g, chip, names[i], on, dots[i], kHitDiscordChip0 + i);
     }
 
-    DrawCard(g, RectF(18, 372, 344, 124));
+    DrawCard(g, RectF(18, 372, 344, 168));
     RowLabel(g, 376, L"Failing to fish alert", L"3 fails in a row, with a screenshot");
     DrawToggle(g, 376, gDiscordFailAlerts.load(), kHitDiscordFail);
     Divider(g, kDiscordMinRowY - 3);
     RowLabel(g, kDiscordMinRowY, L"No catch for", L"minutes of fishing = failing too (0 = off)");
     FillInset(g, RectF(266, kDiscordMinRowY + 5, 80, 30), 9.0f);
     Divider(g, 453);
-    RowLabel(g, 456, L"Ping @everyone", L"in every message");
+    RowLabel(g, 456, L"Ping", L"in every message");
     DrawToggle(g, 456, gDiscordPing.load(), kHitDiscordPing);
+    Divider(g, kDiscordPingRowY - 3);
+    RowLabel(g, kDiscordPingRowY, L"Ping who", L"everyone, or your user ID");
+    FillInset(g, RectF(206, kDiscordPingRowY + 5, 140, 30), 9.0f);
 
-    GradientButton(g, RectF(18, 506, 150, 40), L"Send test", kHitDiscordTest, 12.0f);
+    GradientButton(g, RectF(18, 550, 150, 40), L"Send test", kHitDiscordTest, 12.0f);
     const int status = gDiscordLastStatus.load();
     if (GetDiscordUrl().empty()) {
         swprintf_s(line, L"No webhook link yet");
@@ -3283,7 +3322,7 @@ void DrawDiscordTab(Gdiplus::Graphics& g) {
         swprintf_s(line, L"Discord error %d (check the link)", status);
     }
     const bool bad = status < 0 || status >= 300;
-    Text(g, line, gFontSmall, bad && status != 0 ? ui::kBad : ui::kSoft, RectF(178, 506, 184, 40));
+    Text(g, line, gFontSmall, bad && status != 0 ? ui::kBad : ui::kSoft, RectF(178, 550, 184, 40));
 }
 
 // Credits page.
@@ -3319,7 +3358,7 @@ void DrawCreditsTab(Gdiplus::Graphics& g) {
 
 // Burger menu: pages in menu order -> page index used by gActiveTab.
 const wchar_t* const kPageNames[8] = {L"Fishing", L"Settings", L"Hotkeys", L"Setup",
-                                      L"Auto Bait", L"Sessions", L"Discord", L"Credits"};
+                                      L"Auto Bait", L"Sessions", L"Discord Webhook", L"Credits"};
 const int kMenuOrder[8] = {0, 5, 1, 2, 3, 4, 6, 7};
 
 void DrawMenu(Gdiplus::Graphics& g) {
@@ -3681,6 +3720,13 @@ void LoadSettings() {
         }
         gDiscordEnabled.store(ReadIntSetting(L"Discord", L"Enabled", 0, path) != 0);
         gDiscordPing.store(ReadIntSetting(L"Discord", L"Ping", 0, path) != 0);
+        gDiscordHideUrl.store(ReadIntSetting(L"Discord", L"HideUrl", 0, path) != 0);
+        wchar_t who[128] = {};
+        GetPrivateProfileStringW(L"Discord", L"PingWho", L"everyone", who, 128, path.c_str());
+        {
+            std::lock_guard<std::mutex> lock(gDiscordUrlMutex);
+            gDiscordPingWho = who;
+        }
         gDiscordFailAlerts.store(ReadIntSetting(L"Discord", L"FailAlerts", 1, path) != 0);
         gDiscordOre.store(ReadIntSetting(L"Discord", L"Ore", 1, path) != 0);
         gDiscordNoCatchMin.store(std::clamp(ReadIntSetting(L"Discord", L"NoCatchMinutes", 10, path), 0, 999));
@@ -3755,6 +3801,8 @@ void SaveSettings() {
     WritePrivateProfileStringW(L"Discord", L"WebhookUrl", GetDiscordUrl().c_str(), path.c_str());
     WriteIntSetting(L"Discord", L"Enabled", gDiscordEnabled.load() ? 1 : 0, path);
     WriteIntSetting(L"Discord", L"Ping", gDiscordPing.load() ? 1 : 0, path);
+    WriteIntSetting(L"Discord", L"HideUrl", gDiscordHideUrl.load() ? 1 : 0, path);
+    WritePrivateProfileStringW(L"Discord", L"PingWho", GetDiscordPingWho().c_str(), path.c_str());
     WriteIntSetting(L"Discord", L"FailAlerts", gDiscordFailAlerts.load() ? 1 : 0, path);
     WriteIntSetting(L"Discord", L"Ore", gDiscordOre.load() ? 1 : 0, path);
     WriteIntSetting(L"Discord", L"NoCatchMinutes", gDiscordNoCatchMin.load(), path);
@@ -3862,6 +3910,7 @@ void SetActiveTab(int tab) {
     const int showDiscord = (tab == 6 && !gMenuOpen) ? SW_SHOW : SW_HIDE;
     if (gDiscordUrlEdit) ShowWindow(gDiscordUrlEdit, showDiscord);
     if (gDiscordMinEdit) ShowWindow(gDiscordMinEdit, showDiscord);
+    if (gDiscordPingEdit) ShowWindow(gDiscordPingEdit, showDiscord);
     if (gBaitAmountEdit) ShowWindow(gBaitAmountEdit, showBait);
     if (gBaitDelayEdit) ShowWindow(gBaitDelayEdit, showBait);
     if (gHoldKeyEdit) ShowWindow(gHoldKeyEdit, show);
@@ -3997,6 +4046,12 @@ void HandleHit(HWND hwnd, int id) {
             break;
         case kHitDiscordToggle:
             gDiscordEnabled.store(!gDiscordEnabled.load());
+            SaveSettings();
+            break;
+        case kHitDiscordHide:
+            gDiscordHideUrl.store(!gDiscordHideUrl.load());
+            SendMessage(gDiscordUrlEdit, EM_SETPASSWORDCHAR, gDiscordHideUrl.load() ? 0x25CF : 0, 0);
+            InvalidateRect(gDiscordUrlEdit, nullptr, TRUE);
             SaveSettings();
             break;
         case kHitDiscordPing:
@@ -4180,6 +4235,14 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             SendMessage(gDiscordUrlEdit, WM_SETFONT, reinterpret_cast<WPARAM>(gSmallEditFont), TRUE);
             SendMessage(gDiscordUrlEdit, EM_SETLIMITTEXT, 1000, 0);
             SetWindowTextW(gDiscordUrlEdit, GetDiscordUrl().c_str());
+            // Visible by default; the Hide button turns it into dots.
+            SendMessage(gDiscordUrlEdit, EM_SETPASSWORDCHAR, gDiscordHideUrl.load() ? 0x25CF : 0, 0);
+            gDiscordPingEdit = CreateWindowEx(0, L"EDIT", L"", WS_CHILD | ES_AUTOHSCROLL,
+                214, static_cast<int>(kDiscordPingRowY) + 12, 124, 18, hwnd,
+                reinterpret_cast<HMENU>(static_cast<INT_PTR>(ID_DISCORD_PING_EDIT)), nullptr, nullptr);
+            SendMessage(gDiscordPingEdit, WM_SETFONT, reinterpret_cast<WPARAM>(gSmallEditFont), TRUE);
+            SendMessage(gDiscordPingEdit, EM_SETLIMITTEXT, 64, 0);
+            SetWindowTextW(gDiscordPingEdit, GetDiscordPingWho().c_str());
             gDiscordMinEdit = CreateNumberEdit(hwnd, ID_DISCORD_MIN_EDIT, 272, static_cast<int>(kDiscordMinRowY) + 9);
             {
                 wchar_t minutes[16];
@@ -4225,6 +4288,20 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
                 }
                 SaveSettings();
                 InvalidateRect(hwnd, nullptr, FALSE);
+            }
+            if (LOWORD(wParam) == ID_DISCORD_PING_EDIT && HIWORD(wParam) == EN_KILLFOCUS) {
+                wchar_t who[128] = {};
+                GetWindowTextW(gDiscordPingEdit, who, 128);
+                std::wstring text(who);
+                while (!text.empty() && iswspace(text.back())) text.pop_back();
+                while (!text.empty() && iswspace(text.front())) text.erase(text.begin());
+                if (text.empty()) text = L"everyone";
+                {
+                    std::lock_guard<std::mutex> lock(gDiscordUrlMutex);
+                    gDiscordPingWho = text;
+                }
+                SetWindowTextW(gDiscordPingEdit, text.c_str());
+                SaveSettings();
             }
             if (LOWORD(wParam) == ID_DISCORD_MIN_EDIT && HIWORD(wParam) == EN_KILLFOCUS) {
                 wchar_t buf[16] = {};
