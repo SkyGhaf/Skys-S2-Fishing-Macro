@@ -85,7 +85,7 @@ constexpr ULONGLONG kMaxHoldKeyMs = 15000;
 // Item-collection check: after releasing T, keep looking for the game's
 // "<item> x1" message this long; without it the hold is retried this many
 // times before the catch is counted as "failed to collect".
-constexpr ULONGLONG kCollectVerifyMs = 2500;
+constexpr ULONGLONG kCollectVerifyMs = 500; // message always shows during the hold (measured)
 constexpr int kCollectRetries = 2;
 // The message must stay visible this long (filters one-frame flashes).
 constexpr double kCollectConfirmMs = 150.0;
@@ -1671,9 +1671,10 @@ DWORD WINAPI TrackerThread(void*) {
 
             // null = still busy; true/false = this minigame's collect result.
             int outcome = -1;
-            if (phase == Phase::HoldKey && now - phaseChangedAt >= gHoldKeyMs.load()) {
-                // T is always held for the full time, even if the message
-                // already showed up.
+            if (phase == Phase::HoldKey && (collectSeen || now - phaseChangedAt >= gHoldKeyMs.load())) {
+                // Release T as soon as the item message is confirmed: the
+                // message means the pickup is done (it shows 2.20-2.33 s after
+                // pressing T). Hold T time is the maximum when no message comes.
                 if (keyDown) KeyEvent(false, kHoldKeyVk);
                 keyDown = false;
                 tUpMs = nowMs;
@@ -2341,15 +2342,15 @@ void DrawFishingTab(Gdiplus::Graphics& g, const Telemetry& t) {
                            t.targetFound ? L"found" : L"---", t.playerFound ? L"found" : L"---");
             }
         } else if (t.phase == Phase::Collect) {
-            swprintf_s(line, L"Waiting to collect  %.1fs / %.0fs",
+            swprintf_s(line, L"Waiting to collect  %.1fs / %.1fs",
                        t.phaseElapsedMs / 1000.0f, gCollectDelayMs.load() / 1000.0f);
         } else if (t.phase == Phase::HoldKey) {
             if (t.collectCheckReady) {
-                swprintf_s(line, L"Holding T  %.1fs / %.0fs  ·  try %d/%d",
+                swprintf_s(line, L"Holding T  %.1fs / %.1fs  ·  try %d/%d",
                            t.phaseElapsedMs / 1000.0f, gHoldKeyMs.load() / 1000.0f,
                            t.collectAttempt + 1, kCollectRetries + 1);
             } else {
-                swprintf_s(line, L"Holding T  %.1fs / %.0fs",
+                swprintf_s(line, L"Holding T  %.1fs / %.1fs",
                            t.phaseElapsedMs / 1000.0f, gHoldKeyMs.load() / 1000.0f);
             }
         } else if (t.phase == Phase::VerifyCollect) {
@@ -2443,7 +2444,7 @@ void DrawFishingTab(Gdiplus::Graphics& g, const Telemetry& t) {
         TextCenter(g, L"Calibrating · see the Setup tab (Esc cancels)", gFontSmall, ui::kWarn,
                    RectF(18, 578, 344, 18));
     } else {
-        swprintf_s(line, L"Session #%d  ·  %ls fishing  ·  v2.7", gCurrentSessionId,
+        swprintf_s(line, L"Session #%d  ·  %ls fishing  ·  v2.8", gCurrentSessionId,
                    FormatHoursMinutes(static_cast<long long>(t.runningMs)).c_str());
         TextCenter(g, line, gFontSmall, ui::kMuted, RectF(18, 578, 344, 18));
     }
@@ -2495,7 +2496,7 @@ void DrawSettingsTab(Gdiplus::Graphics& g) {
     const wchar_t* titles[6] = {L"Wait for fish", L"Collect delay", L"Hold T time",
                                 L"Auto reposition", L"Reset every", L"Minigame log"};
     const wchar_t* subs[6] = {L"seconds before re-casting", L"seconds before holding T",
-                              L"seconds T is held to collect",
+                              L"max; lets go when the item shows",
                               L"reset character (Esc · R · Enter)",
                               L"minigames (also after 2 missed casts)",
                               L"CSV + item captures in logs\\ (tuning)"};
@@ -3145,15 +3146,20 @@ void LoadSettings() {
     gRespawnEveryCatches.store(std::clamp<int>(
         ReadIntSetting(L"Fishing", L"RespawnEveryCatches", kDefaultRespawnEveryCatches, path),
         kMinRespawnEveryCatches, kMaxRespawnEveryCatches));
-    gCollectDelayMs.store(std::min<ULONGLONG>(
-        static_cast<ULONGLONG>(GetPrivateProfileIntW(L"Fishing", L"CollectDelaySeconds",
-            static_cast<UINT>(kDefaultCollectDelayMs / 1000), path.c_str())) * 1000ULL,
-        kMaxCollectDelayMs));
+    {
+        // Stored in ms now (0.1 s steps); older ini files only have whole seconds.
+        const int seconds = ReadIntSetting(L"Fishing", L"CollectDelaySeconds",
+                                           static_cast<int>(kDefaultCollectDelayMs / 1000), path);
+        const int ms = ReadIntSetting(L"Fishing", L"CollectDelayMs", seconds * 1000, path);
+        gCollectDelayMs.store(std::min<ULONGLONG>(static_cast<ULONGLONG>(std::max(0, ms)), kMaxCollectDelayMs));
+    }
     gMinigameLog.store(GetPrivateProfileIntW(L"Debug", L"MinigameLog", 0, path.c_str()) != 0);
-    gHoldKeyMs.store(std::clamp<ULONGLONG>(
-        static_cast<ULONGLONG>(GetPrivateProfileIntW(L"Fishing", L"HoldKeySeconds",
-            static_cast<UINT>(kDefaultHoldKeyMs / 1000), path.c_str())) * 1000ULL,
-        kMinHoldKeyMs, kMaxHoldKeyMs));
+    {
+        const int seconds = ReadIntSetting(L"Fishing", L"HoldKeySeconds",
+                                           static_cast<int>(kDefaultHoldKeyMs / 1000), path);
+        const int ms = ReadIntSetting(L"Fishing", L"HoldKeyMs", seconds * 1000, path);
+        gHoldKeyMs.store(std::clamp<ULONGLONG>(static_cast<ULONGLONG>(std::max(0, ms)), kMinHoldKeyMs, kMaxHoldKeyMs));
+    }
     {
         const int amount = ReadIntSetting(L"Bait", L"Amount", kBaitPerCycle, path);
         gBaitAmount.store(std::clamp((amount + kBaitPerCycle - 1) / kBaitPerCycle, 1, 999) * kBaitPerCycle);
@@ -3213,8 +3219,8 @@ void SaveSettings() {
     WritePrivateProfileStringW(L"Fishing", L"WaitForFishSeconds", buf, path.c_str());
     WriteIntSetting(L"Fishing", L"AutoRespawn", gAutoRespawn.load() ? 1 : 0, path);
     WriteIntSetting(L"Fishing", L"RespawnEveryCatches", gRespawnEveryCatches.load(), path);
-    WriteIntSetting(L"Fishing", L"CollectDelaySeconds", static_cast<int>(gCollectDelayMs.load() / 1000), path);
-    WriteIntSetting(L"Fishing", L"HoldKeySeconds", static_cast<int>(gHoldKeyMs.load() / 1000), path);
+    WriteIntSetting(L"Fishing", L"CollectDelayMs", static_cast<int>(gCollectDelayMs.load()), path);
+    WriteIntSetting(L"Fishing", L"HoldKeyMs", static_cast<int>(gHoldKeyMs.load()), path);
     WriteIntSetting(L"Bait", L"Amount", gBaitAmount.load(), path);
     WriteIntSetting(L"Bait", L"DelayMs", gBaitDelayMs.load(), path);
     for (int i = 0; i < kBaitClicks; ++i) {
@@ -3349,30 +3355,37 @@ void UpdateWaitForFishSetting() {
     SaveSettings();
 }
 
-void UpdateCollectDelaySetting() {
+// "2.6" (or "2,6") seconds -> 2600 ms; false if the text isn't a number.
+bool ReadSecondsEdit(HWND edit, ULONGLONG& ms) {
     wchar_t buf[32]{};
-    GetWindowTextW(gCollectEdit, buf, 32);
-    wchar_t* end = nullptr;
-    const unsigned long value = wcstoul(buf, &end, 10);
-    if (end != buf) {
-        gCollectDelayMs.store(std::min<ULONGLONG>(static_cast<ULONGLONG>(value) * 1000ULL, kMaxCollectDelayMs));
+    GetWindowTextW(edit, buf, 32);
+    for (wchar_t* c = buf; *c; ++c) {
+        if (*c == L',') *c = L'.';
     }
-    swprintf_s(buf, L"%u", static_cast<unsigned>(gCollectDelayMs.load() / 1000));
-    SetWindowTextW(gCollectEdit, buf);
+    wchar_t* end = nullptr;
+    const double seconds = wcstod(buf, &end);
+    if (end == buf || seconds < 0.0) return false;
+    ms = static_cast<ULONGLONG>(std::lround(std::min(seconds, 999.0) * 10.0)) * 100ULL; // 0.1 s steps
+    return true;
+}
+
+void ShowSecondsEdit(HWND edit, ULONGLONG ms) {
+    wchar_t buf[32];
+    swprintf_s(buf, L"%.1f", ms / 1000.0);
+    SetWindowTextW(edit, buf);
+}
+
+void UpdateCollectDelaySetting() {
+    ULONGLONG ms = 0;
+    if (ReadSecondsEdit(gCollectEdit, ms)) gCollectDelayMs.store(std::min(ms, kMaxCollectDelayMs));
+    ShowSecondsEdit(gCollectEdit, gCollectDelayMs.load());
     SaveSettings();
 }
 
 void UpdateHoldKeySetting() {
-    wchar_t buf[32]{};
-    GetWindowTextW(gHoldKeyEdit, buf, 32);
-    wchar_t* end = nullptr;
-    const unsigned long value = wcstoul(buf, &end, 10);
-    if (end != buf) {
-        gHoldKeyMs.store(std::clamp<ULONGLONG>(static_cast<ULONGLONG>(value) * 1000ULL,
-                                               kMinHoldKeyMs, kMaxHoldKeyMs));
-    }
-    swprintf_s(buf, L"%u", static_cast<unsigned>(gHoldKeyMs.load() / 1000));
-    SetWindowTextW(gHoldKeyEdit, buf);
+    ULONGLONG ms = 0;
+    if (ReadSecondsEdit(gHoldKeyEdit, ms)) gHoldKeyMs.store(std::clamp(ms, kMinHoldKeyMs, kMaxHoldKeyMs));
+    ShowSecondsEdit(gHoldKeyEdit, gHoldKeyMs.load());
     SaveSettings();
 }
 
@@ -3537,9 +3550,9 @@ void HandleHit(HWND hwnd, int id) {
     InvalidateRect(hwnd, nullptr, FALSE);
 }
 
-HWND CreateNumberEdit(HWND parent, int id, int x, int y) {
+HWND CreateNumberEdit(HWND parent, int id, int x, int y, bool decimal = false) {
     HWND edit = CreateWindowEx(0, L"EDIT", L"",
-        WS_CHILD | WS_VISIBLE | ES_NUMBER | ES_AUTOHSCROLL | ES_CENTER,
+        WS_CHILD | WS_VISIBLE | (decimal ? 0 : ES_NUMBER) | ES_AUTOHSCROLL | ES_CENTER,
         x, y, 68, 22, parent, reinterpret_cast<HMENU>(static_cast<INT_PTR>(id)), nullptr, nullptr);
     SendMessage(edit, WM_SETFONT, reinterpret_cast<WPARAM>(gUiFont), TRUE);
     SendMessage(edit, EM_SETLIMITTEXT, 3, 0);
@@ -3552,8 +3565,10 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             // Positioned over the inset boxes drawn in DrawSettingsTab.
             const auto editY = [](int row) { return static_cast<int>(SettingsRowY(row)) + 9; };
             gWaitFishEdit = CreateNumberEdit(hwnd, ID_WAIT_FISH_EDIT, 272, editY(0));
-            gCollectEdit = CreateNumberEdit(hwnd, ID_COLLECT_EDIT, 272, editY(1));
-            gHoldKeyEdit = CreateNumberEdit(hwnd, ID_HOLD_EDIT, 272, editY(2));
+            gCollectEdit = CreateNumberEdit(hwnd, ID_COLLECT_EDIT, 272, editY(1), true);
+            gHoldKeyEdit = CreateNumberEdit(hwnd, ID_HOLD_EDIT, 272, editY(2), true);
+            SendMessage(gCollectEdit, EM_SETLIMITTEXT, 4, 0);
+            SendMessage(gHoldKeyEdit, EM_SETLIMITTEXT, 4, 0);
             gRespawnEdit = CreateNumberEdit(hwnd, ID_RESPAWN_EDIT, 272, editY(4));
             gBaitAmountEdit = CreateNumberEdit(hwnd, ID_BAIT_AMOUNT_EDIT, 272, static_cast<int>(kBaitAmountRowY) + 9);
             gBaitDelayEdit = CreateNumberEdit(hwnd, ID_BAIT_DELAY_EDIT, 272, static_cast<int>(kBaitDelayRowY) + 9);
@@ -3564,10 +3579,8 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             SetWindowTextW(gBaitAmountEdit, buf);
             swprintf_s(buf, L"%d", gBaitDelayMs.load());
             SetWindowTextW(gBaitDelayEdit, buf);
-            swprintf_s(buf, L"%u", static_cast<unsigned>(gHoldKeyMs.load() / 1000));
-            SetWindowTextW(gHoldKeyEdit, buf);
-            swprintf_s(buf, L"%u", static_cast<unsigned>(gCollectDelayMs.load() / 1000));
-            SetWindowTextW(gCollectEdit, buf);
+            ShowSecondsEdit(gHoldKeyEdit, gHoldKeyMs.load());
+            ShowSecondsEdit(gCollectEdit, gCollectDelayMs.load());
             swprintf_s(buf, L"%u", static_cast<unsigned>(gWaitForFishMs.load() / 1000));
             SetWindowTextW(gWaitFishEdit, buf);
             swprintf_s(buf, L"%d", gRespawnEveryCatches.load());

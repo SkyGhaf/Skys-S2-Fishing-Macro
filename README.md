@@ -43,7 +43,8 @@ on your own screen, so it runs at any resolution.
 - **Equip on start:** every time you press Start it quickly taps the *correction key* (default
   `1`) and then the *rod key* (default `5`). You can change both in the **Hotkeys** tab.
 - **Collect delay / Hold T time:** choose how long to wait after the minigame before holding **T**,
-  and how long T is held (both default 4 s). These settings are on the **Settings** tab.
+  and the maximum time T is held (it lets go as soon as the item message shows). Both can be set
+  in 0.1 s steps on the **Settings** tab.
 - **Minimize:** use the `–` button in the header. The macro keeps running, and you can bring it
   back from the taskbar.
 - **Minigame log (Setup tab):** writes one CSV per minigame to `logs\` (zone, block, velocities,
