@@ -1458,12 +1458,14 @@ DWORD WINAPI DiscordThread(void*) {
 // contrast - and the measured shift is walked off with W/A/S/D using
 // per-tap steps learned right after calibrating.
 // ---------------------------------------------------------------------------
-constexpr int kAnchorSearch = 48;          // px searched around the anchor spot
+// px searched around the anchor spot. One 90 ms tap moved the view ~24 px in
+// a live test, so the old 48 px was left behind after 2 taps while learning.
+constexpr int kAnchorSearch = 96;
 // Below this the anchor counts as not found. Measured: real matches 0.85-1.00
 // (shifts, +-25% light, +-5% zoom), 5 deg rotated view 0.50, blocked 0.16.
 constexpr double kAnchorMinScore = 0.6;
 constexpr int kWalkTapMs = 90;             // one step = a 90 ms key tap
-constexpr int kWalkOkPx = 4;               // close enough
+constexpr int kWalkOkPx = 5;               // close enough
 
 struct WalkStep { float x = 0, y = 0; };   // scene shift in px per tap
 std::mutex gAnchorMutex;
@@ -1600,8 +1602,8 @@ AnchorMatch MeasureAnchor() {
     EdgeMap(surface.pixels, winW, winH, cur);
     int bestX = kAnchorSearch, bestY = kAnchorSearch;
     double best = -2.0;
-    for (int oy = 0; oy <= 2 * kAnchorSearch; oy += 4) {
-        for (int ox = 0; ox <= 2 * kAnchorSearch; ox += 4) {
+    for (int oy = 0; oy <= 2 * kAnchorSearch; oy += 5) {
+        for (int ox = 0; ox <= 2 * kAnchorSearch; ox += 5) {
             const double z = Zncc(ref, cur, winW, winH, ox, oy, 2);
             if (z > best) { best = z; bestX = ox; bestY = oy; }
         }
@@ -1682,6 +1684,16 @@ bool CaptureAnchorReference(const RECT& r) {
         SetWalkStatus(L"box too small - drag at least 60x40 px");
         return false;
     }
+    // In third person the camera looks at the character, so it sits around
+    // the screen centre; an anchor there gets covered by the character, its
+    // rod and the "Collect" prompt.
+    const int cx = GetSystemMetrics(SM_CXSCREEN) / 2, cy = GetSystemMetrics(SM_CYSCREEN) / 2;
+    const RECT character{cx - 160, cy - 260, cx + 160, cy + 200};
+    RECT overlap;
+    if (IntersectRect(&overlap, &r, &character)) {
+        SetWalkStatus(L"too close to your character - pick a spot further away");
+        return false;
+    }
     const int winW = (r.right - r.left) + 2 * kAnchorSearch, winH = (r.bottom - r.top) + 2 * kAnchorSearch;
     CaptureSurface surface;
     if (!surface.Create(winW, winH) || !surface.Grab(r.left - kAnchorSearch, r.top - kAnchorSearch)) return false;
@@ -1748,7 +1760,7 @@ bool LearnWalkSteps() {
         }
         AnchorMatch before = start;
         float sx = 0, sy = 0;
-        for (int i = 0; i < 3; ++i) {
+        for (int i = 0; i < 2; ++i) {
             TapWalkKey(key, 1);
             WaitStableAnchor(150, 600);
             const AnchorMatch after = MeasureAnchor();
@@ -1762,14 +1774,14 @@ bool LearnWalkSteps() {
             sy += static_cast<float>(after.dy - before.dy);
             before = after;
         }
-        learned[key].x = sx / 3.0f;
-        learned[key].y = sy / 3.0f;
-        TapWalkKey((key + 2) % 4, 3); // W<->S, A<->D: walk back
+        learned[key].x = sx / 2.0f;
+        learned[key].y = sy / 2.0f;
+        TapWalkKey((key + 2) % 4, 2); // W<->S, A<->D: walk back
         WaitStableAnchor(150, 600);
         const AnchorMatch back = MeasureAnchor();
         WalkLog("learn", key, back, keyNames[key], "back");
         const double residual = back.valid ? std::hypot(back.dx - start.dx, back.dy - start.dy) : 1e9;
-        const double moved = 3.0 * std::hypot(learned[key].x, learned[key].y);
+        const double moved = 2.0 * std::hypot(learned[key].x, learned[key].y);
         if (back.score < kAnchorMinScore || residual > std::max(6.0, 0.35 * moved)) {
             SetWalkStatus(L"didn't end where it started - camera turning?");
             return false;
@@ -1873,18 +1885,26 @@ WalkResult WalkBackToAnchor() {
             result.lost = true;
             return result;
         }
-        const int left = kMaxWalkTaps - result.taps;
-        int tapsA = std::min({4, left, static_cast<int>(std::lround(0.8 * bestA))});
-        int tapsB = std::min({4, left - tapsA, static_cast<int>(std::lround(0.8 * bestB))});
-        if (tapsA == 0 && tapsB == 0) {    // less than one step: do the bigger one once
-            if (bestA >= bestB) tapsA = 1; else tapsB = 1;
+        // Roblox characters start and stop almost instantly, so the distance
+        // walked is ~proportional to how long the key is held: hold each key
+        // for 80% of the needed amount (in ms) instead of whole 90 ms taps,
+        // which were ~24 px each - too coarse to land within 5 px.
+        auto holdMs = [](double steps) {
+            const double ms = 0.8 * steps * kWalkTapMs;
+            return ms < 12.0 ? 0 : static_cast<int>(std::lround(std::min(ms, 360.0)));
+        };
+        int msA = holdMs(bestA), msB = holdMs(bestB);
+        if (msA == 0 && msB == 0) {        // tiny: nudge the bigger one
+            if (bestA >= bestB) msA = 25; else msB = 25;
         }
-        char action[32];
-        snprintf(action, sizeof(action), "%dx%s %dx%s", tapsA, keyNames[bestKey1], tapsB, keyNames[bestKey2]);
+        if (msA > 0 && msA < 25) msA = 25; // shorter presses may not register
+        if (msB > 0 && msB < 25) msB = 25;
+        char action[40];
+        snprintf(action, sizeof(action), "%dms %s %dms %s", msA, keyNames[bestKey1], msB, keyNames[bestKey2]);
         WalkLog("walk", round, m, action, "walking");
-        TapWalkKey(bestKey1, tapsA);
-        TapWalkKey(bestKey2, tapsB);
-        result.taps += tapsA + tapsB;
+        if (msA > 0) { KeyEvent(true, kWalkKeys[bestKey1]); Sleep(msA); KeyEvent(false, kWalkKeys[bestKey1]); Sleep(40); }
+        if (msB > 0) { KeyEvent(true, kWalkKeys[bestKey2]); Sleep(msB); KeyEvent(false, kWalkKeys[bestKey2]); }
+        result.taps += (msA + msB + kWalkTapMs - 1) / kWalkTapMs;
         WaitStableAnchor(150, 600);
     }
     result.lost = true;
