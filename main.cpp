@@ -1208,6 +1208,12 @@ DWORD WINAPI TrackerThread(void*) {
     std::vector<uint32_t> collectBaseline;
     bool collectSeen = false;
     double collectHitSinceMs = -1.0;
+    // Collect timing (Minigame log): to tune collect delay / hold time from data.
+    double minigameEndMs = 0.0;      // hook -> collect
+    double firstTDownMs = 0.0;       // first T press of this collect
+    double tDownMs = 0.0;            // T press of the current attempt
+    double tUpMs = 0.0;              // T release of the current attempt
+    double messageFirstMs = -1.0;    // first frame the message was visible (current attempt)
     int rarityCounts[kRarityCount] = {};
     int lastRarity = -1;
     int oreCount = 0;
@@ -1242,6 +1248,7 @@ DWORD WINAPI TrackerThread(void*) {
         const int score = CollectMessageScore(collectSurface, collectBaseline);
         if (score >= needed) {
             if (collectHitSinceMs < 0.0) collectHitSinceMs = nowMs;
+            if (messageFirstMs < 0.0) messageFirstMs = nowMs;
             if (nowMs - collectHitSinceMs >= kCollectConfirmMs) collectSeen = true;
             // The message fades in and out; the rarity line is clearest on the
             // frame with the most (fully opaque) text.
@@ -1637,6 +1644,7 @@ DWORD WINAPI TrackerThread(void*) {
                 minigameLog.Close(hookFrames, hookInZone);
                 hookActive = false;
                 collectAttempt = 0;
+                minigameEndMs = nowMs;
                 phase = Phase::Collect;
                 current.phase = phase;
                 phaseChangedAt = now;
@@ -1652,6 +1660,8 @@ DWORD WINAPI TrackerThread(void*) {
                 if (FocusGame()) {
                     KeyEvent(true, kHoldKeyVk);
                     keyDown = true;
+                    tDownMs = firstTDownMs = PreciseMs();
+                    messageFirstMs = -1.0;
                 }
             }
         } else if (phase == Phase::HoldKey || phase == Phase::VerifyCollect) {
@@ -1666,6 +1676,7 @@ DWORD WINAPI TrackerThread(void*) {
                 // already showed up.
                 if (keyDown) KeyEvent(false, kHoldKeyVk);
                 keyDown = false;
+                tUpMs = nowMs;
                 if (!checking) outcome = 1;          // no collect region: old behaviour
                 else if (collectSeen) outcome = 1;
                 else {
@@ -1697,6 +1708,8 @@ DWORD WINAPI TrackerThread(void*) {
                         if (FocusGame()) {
                             KeyEvent(true, kHoldKeyVk);
                             keyDown = true;
+                            tDownMs = PreciseMs();
+                            messageFirstMs = -1.0;
                         }
                     } else {
                         outcome = 0;
@@ -1733,6 +1746,30 @@ DWORD WINAPI TrackerThread(void*) {
                 else {
                     ++failedCollects;
                     lastWasOre = false;
+                }
+                if (checking && gMinigameLog.load()) {
+                    // One line per collect: when the item message showed up
+                    // relative to the minigame end and to pressing/releasing T.
+                    const std::wstring path = LogsDir() + L"\\collect_timing.csv";
+                    FILE* f = _wfopen(path.c_str(), L"a");
+                    if (f) {
+                        fseek(f, 0, SEEK_END);
+                        if (ftell(f) == 0) {
+                            fprintf(f, "time,outcome,attempts,rarity,collect_delay_ms,hold_ms,"
+                                       "tdown_after_minigame_ms,msg_after_tdown_ms,msg_after_tup_ms,"
+                                       "collect_total_ms\n");
+                        }
+                        SYSTEMTIME st;
+                        GetLocalTime(&st);
+                        const bool seen = messageFirstMs >= 0.0;
+                        fprintf(f, "%02u:%02u:%02u,%s,%d,%ls,%llu,%llu,%.0f,%.0f,%.0f,%.0f\n",
+                                st.wHour, st.wMinute, st.wSecond, outcome == 1 ? "item" : "none",
+                                collectAttempt + 1, outcome == 1 ? kRarityNames[attemptRarity] : L"-",
+                                gCollectDelayMs.load(), gHoldKeyMs.load(), firstTDownMs - minigameEndMs,
+                                seen ? messageFirstMs - tDownMs : -1.0, seen ? messageFirstMs - tUpMs : -1.0,
+                                nowMs - minigameEndMs);
+                        fclose(f);
+                    }
                 }
                 if (checking) lastCollectDetected = outcome;
                 ++catchesSinceRespawn;
