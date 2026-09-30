@@ -1477,7 +1477,7 @@ std::vector<float> gAnchorEdges;           // edges of the anchor window at cali
 int gAnchorWinW = 0, gAnchorWinH = 0;      // anchor rect + kAnchorSearch on every side
 WalkStep gWalkSteps[4];                    // W, A, S, D
 bool gWalkLearned = false;
-int gWalkLagMs = 0;                        // extra ms of movement after release
+int gWalkLagMs = 0;                        // extra ms of movement after release (negative: dead time at the start)
 const WORD kWalkKeys[4] = {'W', 'A', 'S', 'D'};
 
 RECT GetAnchorRect() {
@@ -1814,7 +1814,7 @@ bool LearnWalkSteps() {
     }
     const double cosWA = (speed[0].x * speed[1].x + speed[0].y * speed[1].y) / (len(speed[0]) * len(speed[1]));
     if (std::fabs(cosWA) > 0.9) { SetWalkStatus(L"W and A move the same way - try again"); return false; }
-    const int lag = static_cast<int>(std::lround(std::clamp(lagSum / 4.0, 0.0, 120.0)));
+    const int lag = static_cast<int>(std::lround(std::clamp(lagSum / 4.0, -60.0, 120.0)));
     char info[48];
     snprintf(info, sizeof(info), "lag %d ms", lag);
     WalkLog("learn", 4, AnchorMatch{}, "-", info);
@@ -1912,10 +1912,13 @@ WalkResult WalkBackToAnchor() {
         // Hold time for a part: 90% of the needed walking minus the lag. If
         // that is shorter than the shortest press, the smallest possible step
         // (min press + lag) would overshoot more than half of it: skip.
+        // (A negative lag means the first ms of a press don't move at all -
+        // measured live: 50 ms ~10 px, 120 ms ~50 px - so presses get longer.)
+        const int minPress = std::max(kWalkMinPressMs, 10 - lag);
         auto holdMs = [&](double units) {
             const double need = 0.9 * units * 100.0;
-            if (need < 0.5 * (kWalkMinPressMs + lag)) return 0;
-            return static_cast<int>(std::lround(std::clamp(need - lag, double(kWalkMinPressMs), 400.0)));
+            if (need < 0.5 * (minPress + lag)) return 0;
+            return static_cast<int>(std::lround(std::clamp(need - lag, double(minPress), 400.0)));
         };
         const int msA = holdMs(bestA), msB = holdMs(bestB);
         if (msA == 0 && msB == 0) {        // closer than the smallest step can fix
@@ -1926,7 +1929,7 @@ WalkResult WalkBackToAnchor() {
         snprintf(action, sizeof(action), "%dms %s %dms %s", msA, keyNames[bestKey1], msB, keyNames[bestKey2]);
         WalkLog("walk", round, m, action, "walking");
         if (msA > 0) { PressWalkKey(bestKey1, msA); ++result.taps; }
-        if (msA > 0 && msB > 0) Sleep(lag + 30); // let the first one stop
+        if (msA > 0 && msB > 0) Sleep(std::max(30, lag + 30)); // let the first one stop
         if (msB > 0) { PressWalkKey(bestKey2, msB); ++result.taps; }
         walkedMs += msA + msB;
         WaitStableAnchor(150, 700);
@@ -4362,7 +4365,7 @@ void LoadSettings() {
             gWalkSteps[k].x = ReadIntSetting(L"Reposition", kx, 0, path) / 100.0f;
             gWalkSteps[k].y = ReadIntSetting(L"Reposition", ky, 0, path) / 100.0f;
         }
-        gWalkLagMs = std::clamp(ReadIntSetting(L"Reposition", L"LagMs", 0, path), 0, 120);
+        gWalkLagMs = std::clamp(ReadIntSetting(L"Reposition", L"LagMs", 0, path), -60, 120);
         gWalkLearned = learned && !gAnchorEdges.empty();
     }
     gRespawnEveryCatches.store(std::clamp<int>(
