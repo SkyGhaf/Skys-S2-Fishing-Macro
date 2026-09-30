@@ -93,6 +93,11 @@ constexpr ULONGLONG kCollectVerifyMs = 500; // message always shows during the h
 constexpr int kCollectRetries = 2;
 // The message must stay visible this long (filters one-frame flashes).
 constexpr double kCollectConfirmMs = 150.0;
+// The item message shows 2.0-2.4 s after T goes down (measured). Anything
+// earlier is something else in the region - e.g. the fish's own "Collect"
+// prompt moving when the character drifted so it lies in the region. Treating
+// that as the message released T early and dropped the fish.
+constexpr double kCollectEarliestMs = 1200.0;
 // Auto reposition (set respawn): every N catches the character is reset with
 // Esc -> R -> Enter, which puts it back on its spawn point and undoes the
 // small drift after each catch. After the keys we wait this long for the
@@ -2058,7 +2063,12 @@ DWORD WINAPI TrackerThread(void*) {
         const int area = collectSurface.width * collectSurface.height;
         const int needed = std::max(20, area / 50); // 2% of the region
         const int score = CollectMessageScore(collectSurface, collectBaseline);
-        if (score >= needed) {
+        // Only a frame with a real banner line counts (a moving prompt or
+        // glare doesn't have one), and never before the message can come.
+        const bool hit = score >= needed && nowMs - tDownMs >= kCollectEarliestMs &&
+            ClassifyRarity(std::vector<uint32_t>(collectSurface.pixels, collectSurface.pixels + area),
+                           collectBaseline, collectSurface.width, collectSurface.height) >= 0;
+        if (hit) {
             if (collectHitSinceMs < 0.0) collectHitSinceMs = nowMs;
             if (messageFirstMs < 0.0) messageFirstMs = nowMs;
             if (nowMs - collectHitSinceMs >= kCollectConfirmMs) collectSeen = true;
