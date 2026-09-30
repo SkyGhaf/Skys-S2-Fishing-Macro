@@ -1661,7 +1661,27 @@ void TapWalkKey(int key, int count) {
 }
 
 // UI thread, right after the anchor box was dragged: store the reference.
+// Why the last "learn steps" failed (shown on the Setup tab); UI reads it.
+std::mutex gWalkStatusMutex;
+std::wstring gWalkStatus;
+
+void SetWalkStatus(const std::wstring& text) {
+    std::lock_guard<std::mutex> lock(gWalkStatusMutex);
+    gWalkStatus = text;
+}
+
+std::wstring GetWalkStatus() {
+    std::lock_guard<std::mutex> lock(gWalkStatusMutex);
+    return gWalkStatus;
+}
+
+constexpr int kMinAnchorW = 60, kMinAnchorH = 40; // smaller boxes don't match reliably
+
 bool CaptureAnchorReference(const RECT& r) {
+    if (r.right - r.left < kMinAnchorW || r.bottom - r.top < kMinAnchorH) {
+        SetWalkStatus(L"box too small - drag at least 60x40 px");
+        return false;
+    }
     const int winW = (r.right - r.left) + 2 * kAnchorSearch, winH = (r.bottom - r.top) + 2 * kAnchorSearch;
     CaptureSurface surface;
     if (!surface.Create(winW, winH) || !surface.Grab(r.left - kAnchorSearch, r.top - kAnchorSearch)) return false;
@@ -1692,21 +1712,52 @@ void LoadAnchorReference(const RECT& r) {
     gAnchorWinH = h;
 }
 
+// Walk-back log (Minigame log on): logs\walkback.csv, one line per step.
+void WalkLog(const char* event, int round, const AnchorMatch& m, const char* action, const char* result) {
+    if (!gMinigameLog.load()) return;
+    FILE* f = _wfopen((LogsDir() + L"\\walkback.csv").c_str(), L"a");
+    if (!f) return;
+    fseek(f, 0, SEEK_END);
+    if (ftell(f) == 0) fprintf(f, "time,event,round,dx,dy,score,action,result\n");
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    fprintf(f, "%02u:%02u:%02u,%s,%d,%d,%d,%.2f,%s,%s\n", st.wHour, st.wMinute, st.wSecond, event, round,
+            m.dx, m.dy, m.score, action, result);
+    fclose(f);
+}
+
 // Learns how far one tap of W, A, S and D shifts the scene: 3 taps per key,
-// waiting for a still frame after each, then walking the same taps back.
+// waiting for a still frame after each, then the same taps back - and checks
+// the result, because bad steps make it walk the wrong way:
+//  - after walking back it must be (nearly) where it started,
+//  - W/S and A/D must roughly cancel out (fails if the camera turns),
+//  - every step must move the view visibly, and W and A must differ in direction.
+// Nothing is saved unless all of that holds.
 bool LearnWalkSteps() {
-    if (!AnchorReady() || !FocusGame()) return false;
+    if (!AnchorReady()) { SetWalkStatus(L"no anchor set"); return false; }
+    if (!FocusGame()) { SetWalkStatus(L"Roblox not in front"); return false; }
+    static const char* const keyNames[4] = {"W", "A", "S", "D"};
     WaitStableAnchor(300, 1500);
     WalkStep learned[4];
     for (int key = 0; key < 4; ++key) {
-        AnchorMatch before = MeasureAnchor();
-        if (!before.valid || before.score < kAnchorMinScore) return false;
+        const AnchorMatch start = MeasureAnchor();
+        WalkLog("learn", key, start, keyNames[key], "start");
+        if (!start.valid || start.score < kAnchorMinScore) {
+            SetWalkStatus(L"anchor not found - pick a still spot");
+            return false;
+        }
+        AnchorMatch before = start;
         float sx = 0, sy = 0;
         for (int i = 0; i < 3; ++i) {
             TapWalkKey(key, 1);
             WaitStableAnchor(150, 600);
             const AnchorMatch after = MeasureAnchor();
-            if (!after.valid || after.score < kAnchorMinScore) return false;
+            WalkLog("learn", key, after, keyNames[key], "tap");
+            if (!after.valid || after.score < kAnchorMinScore) {
+                TapWalkKey((key + 2) % 4, i + 1);
+                SetWalkStatus(L"anchor lost while stepping - bigger/other spot");
+                return false;
+            }
             sx += static_cast<float>(after.dx - before.dx);
             sy += static_cast<float>(after.dy - before.dy);
             before = after;
@@ -1715,10 +1766,34 @@ bool LearnWalkSteps() {
         learned[key].y = sy / 3.0f;
         TapWalkKey((key + 2) % 4, 3); // W<->S, A<->D: walk back
         WaitStableAnchor(150, 600);
+        const AnchorMatch back = MeasureAnchor();
+        WalkLog("learn", key, back, keyNames[key], "back");
+        const double residual = back.valid ? std::hypot(back.dx - start.dx, back.dy - start.dy) : 1e9;
+        const double moved = 3.0 * std::hypot(learned[key].x, learned[key].y);
+        if (back.score < kAnchorMinScore || residual > std::max(6.0, 0.35 * moved)) {
+            SetWalkStatus(L"didn't end where it started - camera turning?");
+            return false;
+        }
     }
+    auto len = [](const WalkStep& v) { return std::hypot(v.x, v.y); };
+    for (int k = 0; k < 4; ++k) {
+        if (len(learned[k]) < 2.0) { SetWalkStatus(L"steps too small - is the anchor far away?"); return false; }
+    }
+    for (int k = 0; k < 2; ++k) {             // W vs S, A vs D
+        const WalkStep& a = learned[k];
+        const WalkStep& b = learned[k + 2];
+        if (std::hypot(a.x + b.x, a.y + b.y) > 0.5 * std::max(len(a), len(b))) {
+            SetWalkStatus(k == 0 ? L"W and S don't cancel out - camera turning?"
+                                 : L"A and D don't cancel out - camera turning?");
+            return false;
+        }
+    }
+    const double cosWA = (learned[0].x * learned[1].x + learned[0].y * learned[1].y) / (len(learned[0]) * len(learned[1]));
+    if (std::fabs(cosWA) > 0.9) { SetWalkStatus(L"W and A move the same way - try again"); return false; }
     std::lock_guard<std::mutex> lock(gAnchorMutex);
     for (int k = 0; k < 4; ++k) gWalkSteps[k] = learned[k];
     gWalkLearned = true;
+    SetWalkStatus(L"");
     return true;
 }
 
@@ -1732,7 +1807,14 @@ struct WalkResult {
 // forward/back and one left/right key by solving a 2x2 system with the
 // learned steps (tries all four key pairs, keeps the one with positive
 // amounts), taps 80% of it (inertia), lets it settle and measures again.
+// Safety: drift per catch is small, so a big jump means something is in
+// front of the anchor - don't walk at all; stop at once if a step makes it
+// worse; at most 12 taps per catch.
+constexpr double kMaxWalkOffset = 35.0;
+constexpr int kMaxWalkTaps = 12;
+
 WalkResult WalkBackToAnchor() {
+    static const char* const keyNames[4] = {"W", "A", "S", "D"};
     WalkResult result;
     WalkStep steps[4];
     {
@@ -1740,27 +1822,37 @@ WalkResult WalkBackToAnchor() {
         for (int k = 0; k < 4; ++k) steps[k] = gWalkSteps[k];
     }
     WaitStableAnchor(300, 1500);       // let the catch/rod animation finish
-    const ULONGLONG start = GetTickCount64();
-    int noProgress = 0;
-    double bestDist = 1e9;
-    for (int round = 0; round < 10; ++round) {
+    double prevDist = -1.0;
+    for (int round = 0; round < 8; ++round) {
         const AnchorMatch m = MeasureAnchor();
+        const double dist = m.valid ? std::hypot(m.dx, m.dy) : 1e9;
+        result.offset = m.valid ? static_cast<int>(std::lround(dist)) : -1;
         if (!m.valid || m.score < kAnchorMinScore) {
+            WalkLog("walk", round, m, "-", "anchor not found");
             result.lost = true;
-            result.offset = m.valid ? static_cast<int>(std::lround(std::hypot(m.dx, m.dy))) : -1;
             return result;
         }
-        const double dist = std::hypot(m.dx, m.dy);
-        result.offset = static_cast<int>(std::lround(dist));
-        if (dist <= kWalkOkPx) return result;
-        if (dist >= bestDist * 0.95) {
-            if (++noProgress >= 2) { result.lost = true; return result; }
-        } else {
-            noProgress = 0;
-            bestDist = dist;
+        if (dist <= kWalkOkPx) {
+            WalkLog("walk", round, m, "-", "ok");
+            return result;
         }
-        if (result.taps >= 30 || GetTickCount64() - start > 8000) { result.lost = true; return result; }
+        if (round == 0 && dist > kMaxWalkOffset) {
+            WalkLog("walk", round, m, "-", "jump too big - not walking");
+            result.lost = true;
+            return result;
+        }
+        if (prevDist >= 0 && dist > prevDist * 1.15) {
+            WalkLog("walk", round, m, "-", "got worse - stopped");
+            result.lost = true;
+            return result;
+        }
+        if (result.taps >= kMaxWalkTaps) {
+            WalkLog("walk", round, m, "-", "tap limit");
+            result.lost = true;
+            return result;
+        }
         if (!FocusGame()) return result; // not in front: try again after the next catch
+        prevDist = dist;
 
         const double tx = -m.dx, ty = -m.dy;
         int bestKey1 = -1, bestKey2 = -1;
@@ -1776,12 +1868,20 @@ WalkResult WalkBackToAnchor() {
                 }
             }
         }
-        if (bestKey1 < 0) { result.lost = true; return result; }
-        int tapsA = std::min(5, static_cast<int>(std::lround(0.8 * bestA)));
-        int tapsB = std::min(5, static_cast<int>(std::lround(0.8 * bestB)));
+        if (bestKey1 < 0) {
+            WalkLog("walk", round, m, "-", "no key mix");
+            result.lost = true;
+            return result;
+        }
+        const int left = kMaxWalkTaps - result.taps;
+        int tapsA = std::min({4, left, static_cast<int>(std::lround(0.8 * bestA))});
+        int tapsB = std::min({4, left - tapsA, static_cast<int>(std::lround(0.8 * bestB))});
         if (tapsA == 0 && tapsB == 0) {    // less than one step: do the bigger one once
             if (bestA >= bestB) tapsA = 1; else tapsB = 1;
         }
+        char action[32];
+        snprintf(action, sizeof(action), "%dx%s %dx%s", tapsA, keyNames[bestKey1], tapsB, keyNames[bestKey2]);
+        WalkLog("walk", round, m, action, "walking");
         TapWalkKey(bestKey1, tapsA);
         TapWalkKey(bestKey2, tapsB);
         result.taps += tapsA + tapsB;
@@ -2505,7 +2605,10 @@ DWORD WINAPI TrackerThread(void*) {
                 }
                 if (checking) lastCollectDetected = outcome;
                 ++catchesSinceRespawn;
-                phase = (gRepositionMode.load() == 2 && WalkLearned()) ? Phase::Reposition : Phase::Cast;
+                // Only after a real catch: after a failed collect the fish may
+                // still be lying there, and walking would lose it.
+                phase = (gRepositionMode.load() == 2 && WalkLearned() && outcome == 1) ? Phase::Reposition
+                                                                                      : Phase::Cast;
                 if (gAutoRespawn.load() &&
                     catchesSinceRespawn >= gRespawnEveryCatches.load() &&
                     ResetCharacter()) {
@@ -3454,8 +3557,16 @@ void DrawSetupTab(Gdiplus::Graphics& g) {
         const bool ready = AnchorReady();
         const bool learned = WalkLearned();
         if (t.learningWalk || gLearnWalkRequested.load()) swprintf_s(line, L"learning W/A/S/D steps...");
-        else if (!ready) swprintf_s(line, L"NOT SET · box a spot that never moves");
-        else if (!learned) swprintf_s(line, L"steps not learned · click Learn");
+        else if (!ready) {
+            const std::wstring why = GetWalkStatus();
+            if (why.empty()) swprintf_s(line, L"NOT SET · box a spot that never moves");
+            else swprintf_s(line, L"%ls", why.c_str());
+        }
+        else if (!learned) {
+            const std::wstring why = GetWalkStatus();
+            if (why.empty()) swprintf_s(line, L"steps not learned · click Learn");
+            else swprintf_s(line, L"failed: %ls", why.c_str());
+        }
         else {
             std::lock_guard<std::mutex> lock(gAnchorMutex);
             float avg = 0;
