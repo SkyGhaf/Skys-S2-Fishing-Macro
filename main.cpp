@@ -2024,6 +2024,11 @@ DWORD WINAPI TrackerThread(void*) {
     bool positionLost = false;
     int positionOffset = -1;
     int lostStreak = 0;
+    // Walk mode: when every T try failed (e.g. walked against a wall and the
+    // "Wall - Stop Climbing" prompt took the T), walk back to the anchor spot
+    // once and try collecting again.
+    bool collectRescue = false;       // the current walk is such a rescue
+    bool collectRescued = false;      // this catch already had its rescue walk
     int attemptRarity = kRarityCommon; // best classification during this attempt
     int attemptBestScore = -1;
     std::vector<uint32_t> attemptRarityFrame; // clearest frame of the message (rarity is read from it)
@@ -2494,6 +2499,7 @@ DWORD WINAPI TrackerThread(void*) {
                 minigameLog.Close(hookFrames, hookInZone);
                 hookActive = false;
                 collectAttempt = 0;
+                collectRescued = false;
                 minigameEndMs = nowMs;
                 phase = Phase::Collect;
                 current.phase = phase;
@@ -2562,6 +2568,14 @@ DWORD WINAPI TrackerThread(void*) {
                             tDownMs = PreciseMs();
                             messageFirstMs = -1.0;
                         }
+                    } else if (!collectRescued && gRepositionMode.load() == 2 && WalkLearned()) {
+                        // Every try failed: probably not on the spot (another
+                        // prompt took the T). Walk back and try again.
+                        collectRescued = true;
+                        collectRescue = true;
+                        phase = Phase::Reposition;
+                        current.phase = phase;
+                        phaseChangedAt = now;
                     } else {
                         outcome = 0;
                     }
@@ -2650,9 +2664,10 @@ DWORD WINAPI TrackerThread(void*) {
                 if (checking) lastCollectDetected = outcome;
                 ++catchesSinceRespawn;
                 // Only after a real catch: after a failed collect the fish may
-                // still be lying there, and walking would lose it.
-                phase = (gRepositionMode.load() == 2 && WalkLearned() && outcome == 1) ? Phase::Reposition
-                                                                                      : Phase::Cast;
+                // still be lying there, and walking would lose it. After a
+                // rescue walk it is already back on the spot.
+                phase = (gRepositionMode.load() == 2 && WalkLearned() && outcome == 1 && !collectRescued)
+                            ? Phase::Reposition : Phase::Cast;
                 if (gAutoRespawn.load() &&
                     catchesSinceRespawn >= gRespawnEveryCatches.load() &&
                     ResetCharacter()) {
@@ -2704,9 +2719,18 @@ DWORD WINAPI TrackerThread(void*) {
             }
             current.positionLost = positionLost;
             current.positionOffset = positionOffset;
-            phase = Phase::Cast;
+            if (collectRescue) {
+                // Back on the spot: collect again (the fish is already down,
+                // so no collect delay), with one retry like a normal collect.
+                collectRescue = false;
+                collectAttempt = kCollectRetries > 0 ? kCollectRetries - 1 : 0;
+                phase = Phase::Collect;
+                phaseChangedAt = GetTickCount64() - gCollectDelayMs.load();
+            } else {
+                phase = Phase::Cast;
+                phaseChangedAt = GetTickCount64();
+            }
             current.phase = phase;
-            phaseChangedAt = GetTickCount64();
             previousMs = PreciseMs();
         } else if (phase == Phase::Respawn) {
             setMouse(false);
