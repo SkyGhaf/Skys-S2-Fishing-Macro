@@ -2388,6 +2388,20 @@ RejoinResult RejoinGame(bool skipReconnect, int attempts) {
         PostMessage(gWindow, WM_TRACKER_UPDATE, 0, 0);
     };
     for (int attempt = 0; attempt < attempts; ++attempt) {
+        // The loading screen: "Skip loading!" is clicked once it has been
+        // there for 10 s (clicking sooner doesn't skip anything yet). It shows up
+        // right after Reconnect, so it is watched from that click on.
+        ULONGLONG skipSince = 0;
+        auto skipLoading = [&]() {
+            POINT skip{};
+            if (!SkipLoadingVisible(&skip)) { skipSince = 0; return false; }
+            if (skipSince == 0) skipSince = GetTickCount64();
+            if (GetTickCount64() - skipSince < 10000) return false;
+            RejoinLog("loading", 0, "skip loading");
+            RejoinClick(skip, 80);
+            skipSince = 0;
+            return true;
+        };
         if (!skipReconnect) {
             // Reconnect: click it, then again every 30 s for as long as the
             // dialog keeps coming back (internet still down), up to an hour.
@@ -2404,6 +2418,7 @@ RejoinResult RejoinGame(bool skipReconnect, int attempts) {
                 POINT button{};
                 const int dialog = DisconnectDialogState(&button);
                 clear = dialog == 0 ? clear + 1 : 0;
+                if (dialog == 0) skipLoading();
                 if (dialog == 1 && (lastClick == 0 || GetTickCount64() - lastClick >= 30000)) {
                     RejoinLog("reconnect", 0, "click");
                     RejoinClick(button, 80);
@@ -2414,19 +2429,6 @@ RejoinResult RejoinGame(bool skipReconnect, int attempts) {
                 if (!RejoinWait(1000)) return RejoinResult::Aborted;
             }
         }
-        // The loading screen: "Skip loading!" is clicked once it has been
-        // there for 10 s (clicking sooner doesn't skip anything yet).
-        ULONGLONG skipSince = 0;
-        auto skipLoading = [&]() {
-            POINT skip{};
-            if (!SkipLoadingVisible(&skip)) { skipSince = 0; return false; }
-            if (skipSince == 0) skipSince = GetTickCount64();
-            if (GetTickCount64() - skipSince < 10000) return false;
-            RejoinLog("loading", 0, "skip loading");
-            RejoinClick(skip, 80);
-            skipSince = 0;
-            return true;
-        };
         // Without the recorded menu steps it can only get as far as the menu.
         if (!RejoinReady()) {
             stage(2);
