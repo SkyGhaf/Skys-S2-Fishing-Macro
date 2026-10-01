@@ -2036,7 +2036,7 @@ int gRejoinCalibIndex = 0;                             // step being recorded (U
 const wchar_t* RejoinStageText(int stage) {
     switch (stage) {
         case 1: return L"Clicking Reconnect · again every 30 s";
-        case 2: return L"Waiting for the PLAY screen";
+        case 2: return L"Loading \u00B7 waiting for the PLAY screen";
         case 3: return L"Waiting for the slot card";
         case 4: return L"Waiting for the JOIN button";
         case 5: return L"Loading into the server";
@@ -2194,6 +2194,49 @@ int DisconnectDialogState(POINT* button) {
     return state;
 }
 
+// The game's own loading screen (black, after Reconnect) has a blue
+// "Skip loading!" button at the bottom centre. Looks for a solid blue block
+// there with dark screen left and right of it; px = an image of the bottom
+// centre of the game window. *button = its centre in image px.
+bool FindSkipLoading(const uint32_t* px, int w, int h, POINT* button) {
+    int count = 0, minX = w, maxX = -1, minY = h, maxY = -1;
+    for (int y = 0; y < h; ++y) {
+        for (int x = 0; x < w; ++x) {
+            int r, g, b;
+            ReadRgb(px[y * w + x], r, g, b);
+            if (b < 170 || r > 130 || b - r < 80 || g > 190) continue;
+            ++count;
+            minX = std::min(minX, x); maxX = std::max(maxX, x);
+            minY = std::min(minY, y); maxY = std::max(maxY, y);
+        }
+    }
+    const int bw = maxX - minX + 1, bh = maxY - minY + 1;
+    if (count < 2500 || bw < 120 || bh < 15 || bh > 120 || count < bw * bh / 2) return false;
+    const int midY = (minY + maxY) / 2;
+    if (midY < h * 72 / 100) return false;     // the menu's blue JOIN button sits higher up
+    for (const int x : {minX - 25, maxX + 25}) {
+        if (x < 0 || x >= w || Luma(px[midY * w + x]) > 50) return false;
+    }
+    if (button) *button = POINT{(minX + maxX) / 2, midY};
+    return true;
+}
+
+bool SkipLoadingVisible(POINT* button) {
+    const HWND game = GameWindow();
+    if (!game || IsIconic(game)) return false;
+    RECT client{};
+    GetClientRect(game, &client);
+    const int w = client.right * 4 / 10, h = client.bottom / 5;
+    POINT origin{(client.right - w) / 2, client.bottom - h};
+    ClientToScreen(game, &origin);
+    CaptureSurface surface;
+    if (w < 200 || h < 60 || !surface.Create(w, h) || !surface.Grab(origin.x, origin.y)) return false;
+    POINT local{};
+    if (!FindSkipLoading(surface.pixels, w, h, &local)) return false;
+    if (button) *button = POINT{origin.x + local.x, origin.y + local.y};
+    return true;
+}
+
 // Rejoin log (Minigame log on): logs\rejoin.csv, one line per step.
 void RejoinLog(const char* step, double score, const char* result) {
     if (!gMinigameLog.load()) return;
@@ -2349,8 +2392,28 @@ RejoinResult RejoinGame(bool skipReconnect, int attempts) {
                 if (!RejoinWait(1000)) return RejoinResult::Aborted;
             }
         }
+        // The loading screen: "Skip loading!" is clicked once it has been
+        // there for 10 s (clicking sooner doesn't skip anything yet).
+        ULONGLONG skipSince = 0;
+        auto skipLoading = [&]() {
+            POINT skip{};
+            if (!SkipLoadingVisible(&skip)) { skipSince = 0; return false; }
+            if (skipSince == 0) skipSince = GetTickCount64();
+            if (GetTickCount64() - skipSince < 10000) return false;
+            RejoinLog("loading", 0, "skip loading");
+            RejoinClick(skip, 80);
+            skipSince = 0;
+            return true;
+        };
         // Without the recorded menu steps it can only get as far as the menu.
-        if (!RejoinReady()) return RejoinResult::NoSteps;
+        if (!RejoinReady()) {
+            stage(2);
+            for (int waited = 0; waited < 90000; waited += 500) {
+                if (skipLoading()) break;
+                if (!RejoinWait(500)) return RejoinResult::Aborted;
+            }
+            return RejoinResult::NoSteps;
+        }
         bool ok = true;
         for (int i = 0; i < kRejoinSteps && ok; ++i) {
             stage(2 + i);
@@ -2373,6 +2436,7 @@ RejoinResult RejoinGame(bool skipReconnect, int attempts) {
                 score = RejoinPatchScore(i);
                 seen = score >= kRejoinMinScore ? seen + 1 : 0;
                 if (seen >= 2) break;
+                if (i == 0 && skipLoading()) hovering = false;
                 if (i > 0 && GetTickCount64() - lastPrevious >= 6000) {
                     // The click on the previous button may not have landed.
                     lastPrevious = GetTickCount64();
