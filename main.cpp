@@ -2305,7 +2305,7 @@ void ReplayCamera() {
     InterruptibleSleep(300);
 }
 
-enum class RejoinResult { Ok, Failed, Aborted };
+enum class RejoinResult { Ok, Failed, Aborted, NoSteps };
 
 // The whole way back into the server. skipReconnect = start at the game's
 // menu (the "Test rejoin" button). Aborted = the user paused or closed.
@@ -2349,6 +2349,8 @@ RejoinResult RejoinGame(bool skipReconnect, int attempts) {
                 if (!RejoinWait(1000)) return RejoinResult::Aborted;
             }
         }
+        // Without the recorded menu steps it can only get as far as the menu.
+        if (!RejoinReady()) return RejoinResult::NoSteps;
         bool ok = true;
         for (int i = 0; i < kRejoinSteps && ok; ++i) {
             stage(2 + i);
@@ -2813,7 +2815,7 @@ DWORD WINAPI TrackerThread(void*) {
             else if (gameMissingSince == 0) gameMissingSince = now;
             const bool closed = gameMissingSince != 0 && now - gameMissingSince >= 30000;
             if (disconnectHits >= 3 || stuckDialogHits >= 20 || closed) {
-                const bool rejoin = disconnectHits >= 3 && gAutoRejoin.load() && RejoinReady();
+                const bool rejoin = disconnectHits >= 3 && gAutoRejoin.load();
                 setMouse(false);
                 sendAlert(DiscordEvent::Disconnected,
                           closed ? L"Roblox is closed. The macro is paused."
@@ -2852,6 +2854,10 @@ DWORD WINAPI TrackerThread(void*) {
                         sendAlert(DiscordEvent::Rejoined, detail);
                     } else if (result == RejoinResult::Failed) {
                         sendAlert(DiscordEvent::Failing, L"Rejoin failed after 3 tries. The macro is paused.");
+                        gEnabled.store(false);
+                    } else if (result == RejoinResult::NoSteps) {
+                        sendAlert(DiscordEvent::Failing, L"Reconnected, but the menu steps (Play, slot, Join) are "
+                                                         L"not recorded yet. The macro is paused.");
                         gEnabled.store(false);
                     }
                 } else {
@@ -4610,7 +4616,7 @@ void DrawRejoinTab(Gdiplus::Graphics& g) {
 
     DrawCard(g, RectF(18, 128, 344, 96));
     RowLabel(g, 134, L"Auto rejoin", L"needs the set-spawn gamepass");
-    DrawToggle(g, 134, gAutoRejoin.load() && ready, kHitRejoinToggle);
+    DrawToggle(g, 134, gAutoRejoin.load(), kHitRejoinToggle);
     Divider(g, 178);
     Gdiplus::Color statusColor = ui::kSoft;
     if (stage > 0) {
@@ -4622,8 +4628,11 @@ void DrawRejoinTab(Gdiplus::Graphics& g) {
     } else if (gCamRecording) {
         swprintf_s(line, L"Set your camera now, then click Done");
         statusColor = ui::kWarn;
+    } else if (!ready && gAutoRejoin.load()) {
+        swprintf_s(line, L"Only clicks Reconnect · record the 3 steps");
+        statusColor = ui::kWarn;
     } else if (!ready) {
-        swprintf_s(line, L"Record the 3 steps below first");
+        swprintf_s(line, L"Off · record the 3 steps below");
         statusColor = ui::kBad;
     } else if (gAutoRejoin.load()) {
         swprintf_s(line, L"Ready · rejoins by itself after a disconnect");
@@ -5118,7 +5127,7 @@ void LoadSettings() {
         gRejoinCamDx.store(ReadIntSetting(L"Rejoin", L"CamDx", 0, path));
         gRejoinCamDy.store(ReadIntSetting(L"Rejoin", L"CamDy", 0, path));
         gRejoinCamWheel.store(ReadIntSetting(L"Rejoin", L"CamWheel", 0, path));
-        gAutoRejoin.store(ReadIntSetting(L"Rejoin", L"Enabled", 0, path) != 0 && RejoinReady());
+        gAutoRejoin.store(ReadIntSetting(L"Rejoin", L"Enabled", 0, path) != 0);
     }
     gRespawnEveryCatches.store(std::clamp<int>(
         ReadIntSetting(L"Fishing", L"RespawnEveryCatches", kDefaultRespawnEveryCatches, path),
@@ -5626,10 +5635,8 @@ void HandleHit(HWND hwnd, int id) {
             SaveSettings();
             break;
         case kHitRejoinToggle:
-            if (RejoinReady()) {
-                gAutoRejoin.store(!gAutoRejoin.load());
-                SaveSettings();
-            }
+            gAutoRejoin.store(!gAutoRejoin.load());
+            SaveSettings();
             break;
         case kHitRejoinSet0: case kHitRejoinSet0 + 1: case kHitRejoinSet0 + 2:
             if (gCalibrating.load() && gCalibrationTarget == CalibrationTarget::RejoinPoint &&
