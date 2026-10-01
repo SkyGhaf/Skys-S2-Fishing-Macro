@@ -2211,11 +2211,11 @@ bool FindSkipLoading(const uint32_t* px, int w, int h, POINT* button) {
         }
     }
     const int bw = maxX - minX + 1, bh = maxY - minY + 1;
-    if (count < 2500 || bw < 120 || bh < 15 || bh > 120 || count < bw * bh / 2) return false;
+    if (count < 1500 || bw < 100 || bh < 15 || bh > 120 || count < bw * bh / 2) return false;
     const int midY = (minY + maxY) / 2;
     if (midY < h * 72 / 100) return false;     // the menu's blue JOIN button sits higher up
     for (const int x : {minX - 25, maxX + 25}) {
-        if (x < 0 || x >= w || Luma(px[midY * w + x]) > 50) return false;
+        if (x < 0 || x >= w || Luma(px[midY * w + x]) > 90) return false;
     }
     if (button) *button = POINT{(minX + maxX) / 2, midY};
     return true;
@@ -2235,6 +2235,28 @@ bool SkipLoadingVisible(POINT* button) {
     if (!FindSkipLoading(surface.pixels, w, h, &local)) return false;
     if (button) *button = POINT{origin.x + local.x, origin.y + local.y};
     return true;
+}
+
+// The game's loading screen is black; its menu (PLAY) is a bright 3D scene.
+// Looks at a block right of and below the centre, away from the HUD's spots.
+bool LoadingScreenVisible() {
+    const HWND game = GameWindow();
+    if (!game || IsIconic(game)) return false;
+    RECT client{};
+    GetClientRect(game, &client);
+    const int w = client.right / 5, h = client.bottom / 4;
+    POINT origin{client.right * 55 / 100, client.bottom * 60 / 100};
+    ClientToScreen(game, &origin);
+    CaptureSurface surface;
+    if (w < 50 || h < 50 || !surface.Create(w, h) || !surface.Grab(origin.x, origin.y)) return false;
+    int dark = 0, total = 0;
+    for (int y = 0; y < h; y += 4) {
+        for (int x = 0; x < w; x += 4) {
+            ++total;
+            if (Luma(surface.pixels[y * w + x]) < 30) ++dark;
+        }
+    }
+    return dark * 10 >= total * 9;
 }
 
 // Rejoin log (Minigame log on): logs\rejoin.csv, one line per step.
@@ -2415,13 +2437,20 @@ RejoinResult RejoinGame(bool skipReconnect, int attempts) {
             return RejoinResult::NoSteps;
         }
         bool ok = true;
+        // The PLAY text sits on a moving 3D scene, so its picture often
+        // doesn't match. Then PLAY is clicked anyway once the loading screen
+        // has been gone for 6 s; the slot card appearing proves it worked.
+        bool blindPlay = false;
         for (int i = 0; i < kRejoinSteps && ok; ++i) {
             stage(2 + i);
             static const char* const names[kRejoinSteps] = {"play", "slot", "join"};
             const POINT p = GetRejoinPoint(i);
             const ULONGLONG start = GetTickCount64();
             ULONGLONG lastPrevious = start;
+            ULONGLONG lastLog = start;
+            ULONGLONG menuSince = 0;           // step 1: loading screen gone since
             bool hovering = false;
+            bool blind = false;
             int seen = 0;
             double score = -1.0;
             while (seen < 2) {
@@ -2436,14 +2465,30 @@ RejoinResult RejoinGame(bool skipReconnect, int attempts) {
                 score = RejoinPatchScore(i);
                 seen = score >= kRejoinMinScore ? seen + 1 : 0;
                 if (seen >= 2) break;
-                if (i == 0 && skipLoading()) hovering = false;
+                if (i == 0) {
+                    if (skipLoading()) hovering = false;
+                    const bool loading = skipSince != 0 || LoadingScreenVisible();
+                    if (loading) menuSince = 0;
+                    else if (menuSince == 0) menuSince = GetTickCount64();
+                    if (menuSince != 0 && GetTickCount64() - menuSince >= 6000) {
+                        blind = blindPlay = true;
+                        break;
+                    }
+                }
+                if (i == 1 && skipLoading()) hovering = false; // PLAY was clicked before the loading screen
+                if (GetTickCount64() - lastLog >= 5000) {
+                    lastLog = GetTickCount64();
+                    RejoinLog(names[i], score, skipSince != 0 ? "waiting (skip button visible)"
+                                               : LoadingScreenVisible() ? "waiting (loading screen)" : "waiting");
+                }
                 if (i > 0 && GetTickCount64() - lastPrevious >= 6000) {
                     // The click on the previous button may not have landed.
                     lastPrevious = GetTickCount64();
                     if (FocusGame()) {
                         GlideMouseTo(GetRejoinPoint(i - 1));
                         InterruptibleSleep(300);
-                        if (RejoinPatchScore(i - 1) >= kRejoinMinScore) {
+                        if (RejoinPatchScore(i - 1) >= kRejoinMinScore ||
+                            (i == 1 && blindPlay && !LoadingScreenVisible())) {
                             RejoinLog(names[i - 1], 0, "click again");
                             RejoinClick(GetRejoinPoint(i - 1), 80);
                         }
@@ -2461,9 +2506,17 @@ RejoinResult RejoinGame(bool skipReconnect, int attempts) {
             }
             if (!ok) {
                 RejoinLog(names[i], score, "not found");
+                // a picture of what was on screen instead, for checking afterwards
+                if (gMinigameLog.load()) {
+                    std::vector<uint32_t> shot;
+                    int sw = 0, sh = 0;
+                    if (CaptureFullScreen(shot, sw, sh)) {
+                        SaveBmp(LogsDir() + L"\\rejoin_notfound_" + std::to_wstring(i + 1) + L".bmp", shot.data(), sw, sh);
+                    }
+                }
                 break;
             }
-            RejoinLog(names[i], score, "click");
+            RejoinLog(names[i], score, blind ? "click (picture didn't match)" : "click");
             const int hold = i == 2 ? gRejoinHoldMs.load() + 500 : 80;
             RejoinClick(p, hold);
             if (i == 2) {
