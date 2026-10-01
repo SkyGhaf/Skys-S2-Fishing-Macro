@@ -1335,7 +1335,7 @@ int PostDiscord(const std::wstring& url, const std::string& json, const std::vec
     parts.dwUrlPathLength = 2048;
     if (!WinHttpCrackUrl(url.c_str(), 0, 0, &parts) || parts.nScheme != INTERNET_SCHEME_HTTPS) return -1;
     int status = -1;
-    HINTERNET session = WinHttpOpen(L"SkysS2FishingMacro/3.0", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
+    HINTERNET session = WinHttpOpen(L"SkysS2FishingMacro/3.1", WINHTTP_ACCESS_TYPE_DEFAULT_PROXY,
                                     WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!session) return -1;
     WinHttpSetTimeouts(session, 5000, 5000, 15000, 15000);
@@ -4048,7 +4048,7 @@ void DrawFishingTab(Gdiplus::Graphics& g, const Telemetry& t) {
         TextCenter(g, L"Calibrating · see the Setup tab (Esc cancels)", gFontSmall, ui::kWarn,
                    RectF(18, 578, 344, 18));
     } else {
-        swprintf_s(line, L"Session #%d  ·  %ls fishing  ·  v3.0", gCurrentSessionId,
+        swprintf_s(line, L"Session #%d  ·  %ls fishing  ·  v3.1", gCurrentSessionId,
                    FormatHoursMinutes(static_cast<long long>(t.runningMs)).c_str());
         TextCenter(g, line, gFontSmall, ui::kMuted, RectF(18, 578, 344, 18));
     }
@@ -4715,7 +4715,7 @@ void DrawCreditsTab(Gdiplus::Graphics& g) {
         Text(g, L"™", gFontButton, ui::kSoft, RectF(bounds.X + bounds.Width - 4, 390, 24, 18));
     }
     Divider(g, 462);
-    TextCenter(g, L"Version 3.0  ·  Project Slayers 2 auto fishing", gFontSmall, ui::kMuted,
+    TextCenter(g, L"Version 3.1  ·  Project Slayers 2 auto fishing", gFontSmall, ui::kMuted,
                RectF(18, 470, 344, 18));
     TextCenter(g, L"Special thanks: midnytejay (original Fishing Hyper Tracker)", gFontSmall, ui::kMuted,
                RectF(18, 492, 344, 18));
