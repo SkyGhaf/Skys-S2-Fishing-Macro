@@ -8,3 +8,6 @@
 logs/
 *_sessions.txt
 *_anchor.bmp
+*_rejoin*.bmp
+*.zip
+*.bak

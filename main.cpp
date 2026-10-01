@@ -77,7 +77,7 @@ enum class ControlState { Waiting, Holding, Releasing, Floating, Paused };
 //   Hook    -> existing bar-catching control, until the exit bar disappears
 //   Collect -> a fixed pause after hooking ends
 //   HoldKey -> holds the T key to collect/confirm, then loops back to Cast
-enum class Phase { Cast, Hook, Collect, HoldKey, VerifyCollect, WaitForFish, Respawn, Reposition };
+enum class Phase { Cast, Hook, Collect, HoldKey, VerifyCollect, WaitForFish, Respawn, Reposition, Rejoin };
 
 // Pause between the minigame ending and holding T to collect (user setting).
 constexpr ULONGLONG kDefaultCollectDelayMs = 4000;
@@ -238,7 +238,8 @@ HBRUSH gBackgroundBrush = nullptr;
 int gActiveTab = 0; // 0 = Fishing, 1 = Settings, 2 = Hotkeys, 3 = Setup
 
 // Which calibration is currently in progress, if any.
-enum class CalibrationTarget { None, CastPoint, BarRegion, ExitRegion, CollectRegion, BaitPoint, AnchorRegion };
+enum class CalibrationTarget { None, CastPoint, BarRegion, ExitRegion, CollectRegion, BaitPoint, AnchorRegion,
+                               RejoinPoint };
 CalibrationTarget gCalibrationTarget = CalibrationTarget::None; // UI thread only
 POINT gDragStart{};   // first corner of a region drag, set by the mouse hook
 bool gDragging = false; // UI thread only; true between mousedown and mouseup
@@ -434,6 +435,7 @@ const wchar_t* PhaseText(Phase phase) {
         case Phase::WaitForFish: return L"WAIT FOR FISH";
         case Phase::Respawn: return L"RESPAWNING";
         case Phase::Reposition: return L"WALKING BACK";
+        case Phase::Rejoin: return L"REJOINING";
     }
     return L"UNKNOWN";
 }
@@ -1171,7 +1173,7 @@ struct MinigameLog {
 // Discord notifications: the tracker only queues a job; a separate thread
 // makes the screenshot PNG and sends it, so fishing never waits on it.
 // ---------------------------------------------------------------------------
-enum class DiscordEvent { Item, Ore, Failing, Test };
+enum class DiscordEvent { Item, Ore, Failing, Test, Disconnected, Rejoined };
 struct DiscordJob {
     DiscordEvent type = DiscordEvent::Test;
     int rarity = -1;
@@ -1183,6 +1185,10 @@ struct DiscordJob {
     std::vector<uint32_t> pixels;    // optional screenshot
     int w = 0, h = 0;
     bool itemCapture = false;        // small item-message capture (framed) vs full screen
+    long long createdAt = 0;         // unix time it was queued (a late delivery says so)
+    std::vector<unsigned char> png;  // built once by the Discord thread
+    bool pngReady = false;
+    bool hasImage = false;
 };
 std::mutex gDiscordMutex;
 std::vector<DiscordJob> gDiscordQueue;
@@ -1212,9 +1218,10 @@ std::wstring GetDiscordPingWho() {
 
 void EnqueueDiscord(DiscordJob&& job) {
     if (!gDiscordEnabled.load() || GetDiscordUrl().empty()) return;
+    job.createdAt = static_cast<long long>(time(nullptr));
     {
         std::lock_guard<std::mutex> lock(gDiscordMutex);
-        if (gDiscordQueue.size() >= 8) return; // never pile up (e.g. no internet)
+        if (gDiscordQueue.size() >= 8) return; // the Discord thread empties this every second
         gDiscordQueue.push_back(std::move(job));
     }
     if (gDiscordWake) SetEvent(gDiscordWake);
@@ -1397,6 +1404,22 @@ std::string DiscordJson(const DiscordJob& job, bool hasImage) {
             title = "\xE2\x9C\x85 Test message";
             description = "Discord notifications are working.";
             break;
+        case DiscordEvent::Disconnected:
+            title = "\xF0\x9F\x94\x8C Disconnected from the game";
+            description = ToUtf8(job.detail);
+            colour = 0xE02424;
+            break;
+        case DiscordEvent::Rejoined:
+            title = "\xE2\x9C\x85 Rejoined - fishing again";
+            description = ToUtf8(job.detail);
+            colour = 0x22C55E;
+            break;
+    }
+    // Held back while there was no internet: say how old the message is.
+    const long long lateMin = job.createdAt > 0 ? (static_cast<long long>(time(nullptr)) - job.createdAt) / 60 : 0;
+    if (lateMin >= 2) {
+        if (!description.empty()) description += "\n";
+        description += "\xE2\x8F\xB1 Sent " + std::to_string(lateMin) + " min late (no internet).";
     }
     char fields[512];
     const double hours = job.runningMs / 3600000.0;
@@ -1435,24 +1458,46 @@ std::string DiscordJson(const DiscordJob& job, bool hasImage) {
     return json;
 }
 
+// Sends the queued messages in order. A message that can't be delivered (no
+// internet, Discord down, rate limit) stays first in line and is retried
+// every 30 s for up to 6 hours - a disconnect alert is exactly the message
+// that is queued while the internet is gone. Screenshots are turned into
+// PNGs right away, so waiting messages don't hold raw full-screen pixels.
 DWORD WINAPI DiscordThread(void*) {
+    std::vector<DiscordJob> pending;
+    ULONGLONG retryAt = 0;
     while (!gQuit.load()) {
         WaitForSingleObject(gDiscordWake, 1000);
-        for (;;) {
-            DiscordJob job;
-            {
-                std::lock_guard<std::mutex> lock(gDiscordMutex);
-                if (gDiscordQueue.empty()) break;
-                job = std::move(gDiscordQueue.front());
-                gDiscordQueue.erase(gDiscordQueue.begin());
-            }
-            if (gQuit.load()) return 0;
-            std::vector<unsigned char> png;
-            const bool hasImage = MakeDiscordPng(job, png);
-            const int status = PostDiscord(GetDiscordUrl(), DiscordJson(job, hasImage), png);
+        {
+            std::lock_guard<std::mutex> lock(gDiscordMutex);
+            for (DiscordJob& job : gDiscordQueue) pending.push_back(std::move(job));
+            gDiscordQueue.clear();
+        }
+        for (DiscordJob& job : pending) {
+            if (job.pngReady) continue;
+            job.hasImage = MakeDiscordPng(job, job.png);
+            job.pngReady = true;
+            std::vector<uint32_t>().swap(job.pixels);
+        }
+        while (pending.size() > 30) {      // long outage: item messages make room for alerts
+            auto item = std::find_if(pending.begin(), pending.end(),
+                                     [](const DiscordJob& j) { return j.type == DiscordEvent::Item; });
+            pending.erase(item != pending.end() ? item : pending.begin());
+        }
+        if (GetTickCount64() < retryAt) continue;
+        while (!pending.empty() && !gQuit.load()) {
+            const DiscordJob& job = pending.front();
+            const int status = PostDiscord(GetDiscordUrl(), DiscordJson(job, job.hasImage), job.png);
             gDiscordLastStatus.store(status);
             gDiscordLastTime.store(static_cast<long long>(time(nullptr)));
             if (gWindow) PostMessage(gWindow, WM_TRACKER_UPDATE, 0, 0);
+            const bool undelivered = status < 0 || status == 429 || status >= 500;
+            if (undelivered && job.type != DiscordEvent::Test &&
+                static_cast<long long>(time(nullptr)) - job.createdAt < 6 * 3600) {
+                retryAt = GetTickCount64() + 30000;
+                break;
+            }
+            pending.erase(pending.begin());
             Sleep(600); // stays well under Discord's webhook rate limit
         }
     }
@@ -1567,13 +1612,13 @@ void EdgeMap(const uint32_t* px, int w, int h, std::vector<float>& out) {
 // Zero-mean normalized cross-correlation of the anchor (the centre of the
 // reference window) against the current window shifted by (ox, oy),
 // sampling every `step` pixels. -1..1, 1 = identical up to brightness/contrast.
-double Zncc(const std::vector<float>& ref, const std::vector<float>& cur, int winW, int winH,
-            int ox, int oy, int step) {
-    const int tw = winW - 2 * kAnchorSearch, th = winH - 2 * kAnchorSearch;
+double ZnccMargin(const std::vector<float>& ref, const std::vector<float>& cur, int winW, int winH,
+                  int margin, int ox, int oy, int step) {
+    const int tw = winW - 2 * margin, th = winH - 2 * margin;
     double st = 0, sv = 0, stt = 0, svv = 0, stv = 0;
     int n = 0;
     for (int y = 1; y < th - 1; y += step) {
-        const float* t = &ref[(kAnchorSearch + y) * winW + kAnchorSearch];
+        const float* t = &ref[(margin + y) * winW + margin];
         const float* v = &cur[(oy + y) * winW + ox];
         for (int x = 1; x < tw - 1; x += step) {
             st += t[x];
@@ -1587,6 +1632,11 @@ double Zncc(const std::vector<float>& ref, const std::vector<float>& cur, int wi
     const double varT = n * stt - st * st, varV = n * svv - sv * sv;
     if (n == 0 || varT <= 1e-6 || varV <= 1e-6) return -1.0;
     return (n * stv - st * sv) / std::sqrt(varT * varV);
+}
+
+double Zncc(const std::vector<float>& ref, const std::vector<float>& cur, int winW, int winH,
+            int ox, int oy, int step) {
+    return ZnccMargin(ref, cur, winW, winH, kAnchorSearch, ox, oy, step);
 }
 
 struct AnchorMatch {
@@ -1948,6 +1998,447 @@ WalkResult WalkBackToAnchor() {
     return result;
 }
 
+// ---------------------------------------------------------------------------
+// Auto rejoin after a disconnect.
+// Roblox's "Disconnected" dialog looks the same in every game: a flat grey
+// box in the middle of the window with a white Reconnect button bottom right.
+// When it shows up the macro clicks Reconnect (again every 30 s while the
+// internet is still down), then walks through the game's own menu with three
+// clicks the user recorded once - Play, the slot card, hold Join - each only
+// when a small picture saved around that spot is really on screen again.
+// After joining it waits for the load, sets the camera from a recorded
+// right-drag + scroll (the camera is back at its default after a join) and
+// goes back to fishing. Needs the set-spawn gamepass: without it the
+// character doesn't spawn at the water.
+// ---------------------------------------------------------------------------
+constexpr int kRejoinSteps = 3;
+const wchar_t* const kRejoinStepNames[kRejoinSteps] = {L"Play button", L"Slot card", L"Join button (hold)"};
+constexpr int kRejoinPatchW = 160, kRejoinPatchH = 60; // picture around the click spot
+constexpr int kRejoinSearch = 12;                      // it may sit this many px off
+constexpr int kRejoinWinW = kRejoinPatchW + 2 * kRejoinSearch;
+constexpr int kRejoinWinH = kRejoinPatchH + 2 * kRejoinSearch;
+constexpr double kRejoinMinScore = 0.55;
+
+std::atomic<bool> gAutoRejoin{false};
+std::mutex gRejoinMutex;
+POINT gRejoinPoints[kRejoinSteps] = {};
+std::vector<float> gRejoinEdges[kRejoinSteps];         // edges of the recorded window (empty = not set)
+std::atomic<int> gRejoinHoldMs{3000};                  // how long Join is held
+std::atomic<int> gRejoinLoadWaitSec{20};               // after Join: loading + spawning
+std::atomic<bool> gRejoinCamSet{false};
+std::atomic<int> gRejoinCamDx{0}, gRejoinCamDy{0}, gRejoinCamWheel{0}; // right-drag (raw mouse units), wheel notches
+// 0 idle, 1 reconnecting, 2-4 waiting for step 1-3, 5 loading, 6 camera
+std::atomic<int> gRejoinStage{0};
+std::atomic<int> gRejoinTestRequest{0};                // UI -> tracker: 1 = camera, 2 = the menu steps
+std::atomic<bool> gRejoinTesting{false};
+int gRejoinCalibIndex = 0;                             // step being recorded (UI thread)
+
+const wchar_t* RejoinStageText(int stage) {
+    switch (stage) {
+        case 1: return L"Clicking Reconnect · again every 30 s";
+        case 2: return L"Waiting for the PLAY screen";
+        case 3: return L"Waiting for the slot card";
+        case 4: return L"Waiting for the JOIN button";
+        case 5: return L"Loading into the server";
+        case 6: return L"Setting the camera";
+    }
+    return L"";
+}
+
+POINT GetRejoinPoint(int i) {
+    std::lock_guard<std::mutex> lock(gRejoinMutex);
+    return gRejoinPoints[i];
+}
+
+bool RejoinStepSet(int i) {
+    std::lock_guard<std::mutex> lock(gRejoinMutex);
+    return !gRejoinEdges[i].empty();
+}
+
+bool RejoinReady() {
+    for (int i = 0; i < kRejoinSteps; ++i) {
+        if (!RejoinStepSet(i)) return false;
+    }
+    return true;
+}
+
+std::wstring RejoinImagePath(int i) {
+    std::wstring path = AnchorImagePath();
+    wchar_t name[32];
+    swprintf_s(name, L"_rejoin%d.bmp", i + 1);
+    return path.substr(0, path.size() - wcslen(L"_anchor.bmp")) + name;
+}
+
+bool GrabRejoinWindow(POINT p, std::vector<uint32_t>& pixels) {
+    CaptureSurface surface;
+    if (!surface.Create(kRejoinWinW, kRejoinWinH) ||
+        !surface.Grab(p.x - kRejoinWinW / 2, p.y - kRejoinWinH / 2)) {
+        return false;
+    }
+    pixels.assign(surface.pixels, surface.pixels + kRejoinWinW * kRejoinWinH);
+    return true;
+}
+
+void SetRejoinStep(int i, POINT p, const std::vector<uint32_t>& pixels, bool save) {
+    if (static_cast<int>(pixels.size()) != kRejoinWinW * kRejoinWinH) return;
+    std::vector<float> edges;
+    EdgeMap(pixels.data(), kRejoinWinW, kRejoinWinH, edges);
+    if (save) SaveBmp(RejoinImagePath(i), pixels.data(), kRejoinWinW, kRejoinWinH);
+    std::lock_guard<std::mutex> lock(gRejoinMutex);
+    gRejoinPoints[i] = p;
+    gRejoinEdges[i] = std::move(edges);
+}
+
+// Startup: the point comes from the ini, the picture from its bmp.
+void LoadRejoinStep(int i, POINT p) {
+    std::vector<uint32_t> pixels;
+    int w = 0, h = 0;
+    if ((p.x == 0 && p.y == 0) || !LoadBmp32(RejoinImagePath(i), pixels, w, h)) return;
+    if (w != kRejoinWinW || h != kRejoinWinH) return;
+    SetRejoinStep(i, p, pixels, false);
+}
+
+// How well the recorded picture of step i matches the screen right now
+// (-1..1, the best spot within +-12 px).
+double RejoinEdgesScore(const std::vector<float>& ref, const std::vector<float>& cur) {
+    double best = -1.0;
+    for (int oy = 0; oy <= 2 * kRejoinSearch; oy += 2) {
+        for (int ox = 0; ox <= 2 * kRejoinSearch; ox += 2) {
+            best = std::max(best, ZnccMargin(ref, cur, kRejoinWinW, kRejoinWinH, kRejoinSearch, ox, oy, 1));
+        }
+    }
+    return best;
+}
+
+double RejoinPatchScore(int i) {
+    std::vector<float> ref;
+    POINT p;
+    {
+        std::lock_guard<std::mutex> lock(gRejoinMutex);
+        ref = gRejoinEdges[i];
+        p = gRejoinPoints[i];
+    }
+    std::vector<uint32_t> pixels;
+    if (ref.empty() || !GrabRejoinWindow(p, pixels)) return -1.0;
+    std::vector<float> cur;
+    EdgeMap(pixels.data(), kRejoinWinW, kRejoinWinH, cur);
+    return RejoinEdgesScore(ref, cur);
+}
+
+// Looks for Roblox's error dialog in an image whose centre is the centre of
+// the game window. 0 = none, 1 = with a Reconnect button (*button = its
+// centre, in image px), 2 = the box without that button.
+int FindDisconnectDialog(const uint32_t* px, int w, int h, POINT* button) {
+    auto grey = [&](int x, int y) {
+        int r, g, b;
+        ReadRgb(px[y * w + x], r, g, b);
+        return std::abs(r - 57) <= 8 && std::abs(g - 59) <= 8 && std::abs(b - 60) <= 8;
+    };
+    const int cx = w / 2, cy = h / 2;
+    // The box: rows around the middle are one unbroken grey run through the
+    // centre column (rows with text are broken up and just don't count).
+    int left = 0, right = -1;
+    for (int y = std::max(0, cy - 80); y <= std::min(h - 1, cy + 80); y += 2) {
+        if (!grey(cx, y)) continue;
+        int l = cx, r = cx;
+        while (l > 0 && grey(l - 1, y)) --l;
+        while (r < w - 1 && grey(r + 1, y)) ++r;
+        if (r - l > right - left) { left = l; right = r; }
+    }
+    const int boxW = right - left + 1;
+    if (boxW < 250 || left <= 0 || right >= w - 1) return 0;
+    int fullRows = 0;
+    for (int y = std::max(0, cy - 80); y <= std::min(h - 1, cy + 80); y += 2) {
+        int run = 0;
+        for (int x = left; x <= right; ++x) run += grey(x, y) ? 1 : 0;
+        if (run >= boxW * 9 / 10) ++fullRows;
+    }
+    if (fullRows < 20) return 0;
+    const int edgeX = left + 6;                // left margin: no text, no buttons
+    int top = cy, bottom = cy;
+    while (top > 0 && grey(edgeX, top - 1)) --top;
+    while (bottom < h - 1 && grey(edgeX, bottom + 1)) ++bottom;
+    const int boxH = bottom - top + 1;
+    if (boxH < 120 || top <= 0 || bottom >= h - 1) return 0;
+    // The white Reconnect button: bottom part of the box, right half.
+    int count = 0, minX = w, maxX = -1, minY = h, maxY = -1;
+    for (int y = top + boxH * 6 / 10; y <= bottom; ++y) {
+        for (int x = left; x <= right; ++x) {
+            int r, g, b;
+            ReadRgb(px[y * w + x], r, g, b);
+            if (r < 245 || g < 245 || b < 245) continue;
+            ++count;
+            minX = std::min(minX, x); maxX = std::max(maxX, x);
+            minY = std::min(minY, y); maxY = std::max(maxY, y);
+        }
+    }
+    if (count < 800 || maxX - minX < 60 || minX < (left + right) / 2 - 10) return 2;
+    if (button) *button = POINT{(minX + maxX) / 2, (minY + maxY) / 2};
+    return 1;
+}
+
+// The same on the live game window; *button is in screen coordinates.
+int DisconnectDialogState(POINT* button) {
+    const HWND game = GameWindow();
+    if (!game || IsIconic(game)) return 0;
+    RECT client{};
+    GetClientRect(game, &client);
+    POINT centre{client.right / 2, client.bottom / 2};
+    ClientToScreen(game, &centre);
+    constexpr int kW = 800, kH = 520;
+    CaptureSurface surface;
+    if (!surface.Create(kW, kH) || !surface.Grab(centre.x - kW / 2, centre.y - kH / 2)) return 0;
+    POINT local{};
+    const int state = FindDisconnectDialog(surface.pixels, kW, kH, &local);
+    if (state == 1 && button) *button = POINT{centre.x - kW / 2 + local.x, centre.y - kH / 2 + local.y};
+    return state;
+}
+
+// Rejoin log (Minigame log on): logs\rejoin.csv, one line per step.
+void RejoinLog(const char* step, double score, const char* result) {
+    if (!gMinigameLog.load()) return;
+    FILE* f = _wfopen((LogsDir() + L"\\rejoin.csv").c_str(), L"a");
+    if (!f) return;
+    fseek(f, 0, SEEK_END);
+    if (ftell(f) == 0) fprintf(f, "date,time,step,score,result\n");
+    SYSTEMTIME st;
+    GetLocalTime(&st);
+    fprintf(f, "%04u-%02u-%02u,%02u:%02u:%02u,%s,%.2f,%s\n", st.wYear, st.wMonth, st.wDay, st.wHour,
+            st.wMinute, st.wSecond, step, score, result);
+    fclose(f);
+}
+
+// The HUD is always on top: if it covers a spot that has to be seen or
+// clicked it is moved to a free corner for the rejoin. Returns where it was.
+RECT MoveHudAside() {
+    RECT old{};
+    GetWindowRect(gWindow, &old);
+    std::vector<RECT> keep;
+    for (int i = 0; i < kRejoinSteps; ++i) {
+        const POINT p = GetRejoinPoint(i);
+        keep.push_back(RECT{p.x - kRejoinWinW / 2, p.y - kRejoinWinH / 2, p.x + kRejoinWinW / 2, p.y + kRejoinWinH / 2});
+    }
+    if (const HWND game = GameWindow()) {
+        RECT client{};
+        GetClientRect(game, &client);
+        POINT centre{client.right / 2, client.bottom / 2};
+        ClientToScreen(game, &centre);
+        keep.push_back(RECT{centre.x - 400, centre.y - 260, centre.x + 400, centre.y + 260});
+    }
+    const int w = old.right - old.left, h = old.bottom - old.top;
+    const int sw = GetSystemMetrics(SM_CXSCREEN), sh = GetSystemMetrics(SM_CYSCREEN);
+    const POINT spots[5] = {{old.left, old.top}, {sw - w - 20, 20}, {sw - w - 20, sh - h - 60},
+                            {20, sh - h - 60}, {20, 20}};
+    for (const POINT& spot : spots) {
+        const RECT hud{spot.x, spot.y, spot.x + w, spot.y + h};
+        bool clear = true;
+        for (const RECT& r : keep) {
+            RECT overlap;
+            if (IntersectRect(&overlap, &hud, &r)) clear = false;
+        }
+        if (!clear) continue;
+        if (spot.x != old.left || spot.y != old.top) {
+            SetWindowPos(gWindow, nullptr, spot.x, spot.y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+        break;
+    }
+    return old;
+}
+
+bool RejoinAlive() {
+    return !gQuit.load() && (gEnabled.load() || gRejoinTesting.load());
+}
+
+bool RejoinWait(int ms) {
+    for (int waited = 0; waited < ms; waited += 50) {
+        if (!RejoinAlive()) return false;
+        Sleep(50);
+    }
+    return RejoinAlive();
+}
+
+void RejoinClick(POINT p, int holdMs) {
+    if (!FocusGame()) return;
+    GlideMouseTo(p);
+    InterruptibleSleep(200);
+    MouseButton(true);
+    InterruptibleSleep(holdMs);
+    MouseButton(false);
+}
+
+// Sets the camera like the user recorded it: the same right-drag (in raw
+// mouse units, sent as relative moves - what Roblox turns the camera with)
+// and the same number of wheel notches. Starts from the default camera of a
+// fresh spawn, so the result is the same view every time.
+void ReplayCamera() {
+    if (!gRejoinCamSet.load() || !FocusGame()) return;
+    const int dx = gRejoinCamDx.load(), dy = gRejoinCamDy.load(), wheel = gRejoinCamWheel.load();
+    GlideMouseTo(GetCastPoint());              // a spot in the world, not on a button
+    InterruptibleSleep(200);
+    INPUT input{};
+    input.type = INPUT_MOUSE;
+    input.mi.dwFlags = MOUSEEVENTF_RIGHTDOWN;
+    SendInput(1, &input, sizeof(input));
+    InterruptibleSleep(150);
+    const int steps = std::max(std::abs(dx), std::abs(dy)) / 15 + 1;
+    int sentX = 0, sentY = 0;
+    for (int i = 1; i <= steps && !gQuit.load(); ++i) {
+        const int wantX = static_cast<int>(static_cast<long long>(dx) * i / steps);
+        const int wantY = static_cast<int>(static_cast<long long>(dy) * i / steps);
+        MoveMouseBy(wantX - sentX, wantY - sentY);
+        sentX = wantX;
+        sentY = wantY;
+        Sleep(5);
+    }
+    InterruptibleSleep(150);
+    input.mi.dwFlags = MOUSEEVENTF_RIGHTUP;
+    SendInput(1, &input, sizeof(input));
+    InterruptibleSleep(250);
+    for (int i = 0; i < std::abs(wheel) && !gQuit.load(); ++i) {
+        INPUT tick{};
+        tick.type = INPUT_MOUSE;
+        tick.mi.dwFlags = MOUSEEVENTF_WHEEL;
+        tick.mi.mouseData = static_cast<DWORD>(wheel > 0 ? WHEEL_DELTA : -WHEEL_DELTA);
+        SendInput(1, &tick, sizeof(tick));
+        Sleep(60);
+    }
+    InterruptibleSleep(300);
+}
+
+enum class RejoinResult { Ok, Failed, Aborted };
+
+// The whole way back into the server. skipReconnect = start at the game's
+// menu (the "Test rejoin" button). Aborted = the user paused or closed.
+RejoinResult RejoinGame(bool skipReconnect, int attempts) {
+    struct Restore {
+        RECT hud;
+        ~Restore() {
+            SetWindowPos(gWindow, nullptr, hud.left, hud.top, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+            gRejoinStage.store(0);
+            PostMessage(gWindow, WM_TRACKER_UPDATE, 0, 0);
+        }
+    } restore{MoveHudAside()};
+    auto stage = [](int value) {
+        gRejoinStage.store(value);
+        PostMessage(gWindow, WM_TRACKER_UPDATE, 0, 0);
+    };
+    for (int attempt = 0; attempt < attempts; ++attempt) {
+        if (!skipReconnect) {
+            // Reconnect: click it, then again every 30 s for as long as the
+            // dialog keeps coming back (internet still down), up to an hour.
+            stage(1);
+            const ULONGLONG start = GetTickCount64();
+            ULONGLONG lastClick = 0;
+            int clear = 0;
+            while (clear < 3) {
+                if (!RejoinAlive()) return RejoinResult::Aborted;
+                if (GetTickCount64() - start > 60ULL * 60 * 1000) {
+                    RejoinLog("reconnect", 0, "gave up after 60 min");
+                    return RejoinResult::Failed;
+                }
+                POINT button{};
+                const int dialog = DisconnectDialogState(&button);
+                clear = dialog == 0 ? clear + 1 : 0;
+                if (dialog == 1 && (lastClick == 0 || GetTickCount64() - lastClick >= 30000)) {
+                    RejoinLog("reconnect", 0, "click");
+                    RejoinClick(button, 80);
+                    lastClick = GetTickCount64();
+                    // off the button: hovering changes its colour
+                    if (FocusGame()) GlideMouseTo(POINT{button.x, button.y - 220});
+                }
+                if (!RejoinWait(1000)) return RejoinResult::Aborted;
+            }
+        }
+        bool ok = true;
+        for (int i = 0; i < kRejoinSteps && ok; ++i) {
+            stage(2 + i);
+            static const char* const names[kRejoinSteps] = {"play", "slot", "join"};
+            const POINT p = GetRejoinPoint(i);
+            const ULONGLONG start = GetTickCount64();
+            ULONGLONG lastPrevious = start;
+            bool hovering = false;
+            int seen = 0;
+            double score = -1.0;
+            while (seen < 2) {
+                if (!RejoinAlive()) return RejoinResult::Aborted;
+                if (GetTickCount64() - start > 120000) { ok = false; break; }
+                // The picture was recorded with the mouse on the button.
+                if (!hovering && FocusGame()) {
+                    GlideMouseTo(p);
+                    InterruptibleSleep(300);
+                    hovering = true;
+                }
+                score = RejoinPatchScore(i);
+                seen = score >= kRejoinMinScore ? seen + 1 : 0;
+                if (seen >= 2) break;
+                if (i > 0 && GetTickCount64() - lastPrevious >= 6000) {
+                    // The click on the previous button may not have landed.
+                    lastPrevious = GetTickCount64();
+                    if (FocusGame()) {
+                        GlideMouseTo(GetRejoinPoint(i - 1));
+                        InterruptibleSleep(300);
+                        if (RejoinPatchScore(i - 1) >= kRejoinMinScore) {
+                            RejoinLog(names[i - 1], 0, "click again");
+                            RejoinClick(GetRejoinPoint(i - 1), 80);
+                        }
+                    }
+                    hovering = false;
+                }
+                POINT button{};
+                if (DisconnectDialogState(&button) == 1) {
+                    RejoinLog(names[i], score, "disconnected again");
+                    skipReconnect = false;
+                    ok = false;
+                    break;
+                }
+                if (!RejoinWait(500)) return RejoinResult::Aborted;
+            }
+            if (!ok) {
+                RejoinLog(names[i], score, "not found");
+                break;
+            }
+            RejoinLog(names[i], score, "click");
+            const int hold = i == 2 ? gRejoinHoldMs.load() + 500 : 80;
+            RejoinClick(p, hold);
+            if (i == 2) {
+                // Still there: the hold was too short or didn't register.
+                for (int again = 1; again <= 3; ++again) {
+                    if (!RejoinWait(1500)) return RejoinResult::Aborted;
+                    if (RejoinPatchScore(2) < kRejoinMinScore) break;
+                    RejoinLog("join", 0, "hold again");
+                    RejoinClick(p, hold + 1000 * again);
+                }
+            } else if (!RejoinWait(1000)) {
+                return RejoinResult::Aborted;
+            }
+        }
+        if (!ok) continue;
+
+        stage(5);
+        int gone = 0;
+        for (int waited = 0; waited < 60000 && gone < 2; waited += 500) {
+            gone = RejoinPatchScore(2) < kRejoinMinScore ? gone + 1 : 0;
+            if (!RejoinWait(500)) return RejoinResult::Aborted;
+        }
+        if (gone < 2) {
+            RejoinLog("load", 0, "join screen stayed");
+            continue;
+        }
+        if (!RejoinWait(gRejoinLoadWaitSec.load() * 1000)) return RejoinResult::Aborted;
+        POINT button{};
+        if (DisconnectDialogState(&button) == 1) {
+            RejoinLog("load", 0, "disconnected again");
+            skipReconnect = false;
+            continue;
+        }
+        stage(6);
+        ReplayCamera();
+        RejoinLog("done", 0, "in game");
+        return RejoinResult::Ok;
+    }
+    return RejoinResult::Failed;
+}
+
 DWORD WINAPI TrackerThread(void*) {
     timeBeginPeriod(1);
     SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
@@ -2041,6 +2532,11 @@ DWORD WINAPI TrackerThread(void*) {
     // "Wall - Stop Climbing" prompt took the T), walk back to the anchor spot
     // once and try collecting again.
     bool collectRescue = false;       // the current walk is such a rescue
+    // Disconnect watch (see "Auto rejoin")
+    ULONGLONG lastDisconnectCheck = 0;
+    int disconnectHits = 0;           // checks in a row with the Reconnect dialog
+    int stuckDialogHits = 0;          // ... with the box but no Reconnect button
+    ULONGLONG gameMissingSince = 0;
     bool collectRescued = false;      // this catch already had its rescue walk
     int attemptRarity = kRarityCommon; // best classification during this attempt
     int attemptBestScore = -1;
@@ -2105,6 +2601,19 @@ DWORD WINAPI TrackerThread(void*) {
         SaveBmp(base + L"_message.bmp", frame.data(), w, h);
     };
 
+    // Alert with a screenshot (follows the "failing to fish alert" switch).
+    auto sendAlert = [&](DiscordEvent type, const std::wstring& detail) {
+        if (!gDiscordFailAlerts.load() || !gDiscordEnabled.load()) return;
+        DiscordJob job;
+        job.type = type;
+        job.detail = detail;
+        job.sessionId = gCurrentSessionId;
+        job.catches = totalCatches;
+        job.ore = oreCount;
+        job.runningMs = runningMs;
+        CaptureFullScreen(job.pixels, job.w, job.h);
+        EnqueueDiscord(std::move(job));
+    };
 
     while (!gQuit.load()) {
         const ULONGLONG now = GetTickCount64(); // coarse; fine for the phase timers
@@ -2212,6 +2721,22 @@ DWORD WINAPI TrackerThread(void*) {
             PostMessage(gWindow, WM_CALIBRATION_DONE + 100, 0, 0); // save the steps (UI thread)
         }
 
+        // Rejoin page tests (only while paused): the camera, or the menu steps.
+        if (const int test = gRejoinTestRequest.exchange(0); test != 0 && !gEnabled.load()) {
+            gRejoinTesting.store(true);
+            if (test == 1) {
+                gRejoinStage.store(6);
+                PostMessage(gWindow, WM_TRACKER_UPDATE, 0, 0);
+                ReplayCamera();
+                gRejoinStage.store(0);
+            } else {
+                RejoinGame(true, 1);
+            }
+            gRejoinTesting.store(false);
+            PostMessage(gWindow, WM_TRACKER_UPDATE, 0, 0);
+            lastLoopMs = previousMs = PreciseMs();
+        }
+
         Telemetry current{};
         current.enabled = gEnabled.load();
         current.runningMs = runningMs;
@@ -2275,6 +2800,70 @@ DWORD WINAPI TrackerThread(void*) {
             wasRunning = true;
             EquipRodOnStart();
             previousMs = PreciseMs();
+        }
+
+        // Disconnect watch: once a second, outside the minigame.
+        if ((phase == Phase::Cast || phase == Phase::WaitForFish) && now - lastDisconnectCheck >= 1000) {
+            lastDisconnectCheck = now;
+            POINT reconnect{};
+            const int dialog = DisconnectDialogState(&reconnect);
+            disconnectHits = dialog == 1 ? disconnectHits + 1 : 0;
+            stuckDialogHits = dialog == 2 ? stuckDialogHits + 1 : 0;
+            if (GameWindow() != nullptr) gameMissingSince = 0;
+            else if (gameMissingSince == 0) gameMissingSince = now;
+            const bool closed = gameMissingSince != 0 && now - gameMissingSince >= 30000;
+            if (disconnectHits >= 3 || stuckDialogHits >= 20 || closed) {
+                const bool rejoin = disconnectHits >= 3 && gAutoRejoin.load() && RejoinReady();
+                setMouse(false);
+                sendAlert(DiscordEvent::Disconnected,
+                          closed ? L"Roblox is closed. The macro is paused."
+                          : rejoin ? L"Trying to rejoin automatically."
+                          : disconnectHits >= 3 ? L"Auto rejoin is off. The macro is paused."
+                                                : L"An error box without a Reconnect button. The macro is paused.");
+                disconnectHits = stuckDialogHits = 0;
+                gameMissingSince = 0;
+                if (rejoin) {
+                    current.phase = Phase::Rejoin;
+                    {
+                        std::lock_guard<std::mutex> lock(gTelemetryMutex);
+                        gTelemetry = current;
+                    }
+                    const ULONGLONG started = GetTickCount64();
+                    const RejoinResult result = RejoinGame(false, 3);
+                    if (result == RejoinResult::Ok) {
+                        EquipRodOnStart();
+                        catchesSinceRespawn = 0;
+                        missedCastsInARow = 0;
+                        lastCastConfirmedAt = 0;
+                        failStreak = 0;
+                        runningAtLastCatch = runningMs;
+                        failAlertSent = false;
+                        wchar_t text[200];
+                        swprintf_s(text, L"Back in the game after %llu min.",
+                                   (GetTickCount64() - started + 30000) / 60000);
+                        std::wstring detail = text;
+                        if (AnchorReady()) {
+                            WaitStableAnchor(300, 1500);
+                            const AnchorMatch view = MeasureAnchor();
+                            if (!view.valid || view.score < kAnchorMinScore) {
+                                detail += L" The view looks different from before - check the camera.";
+                            }
+                        }
+                        sendAlert(DiscordEvent::Rejoined, detail);
+                    } else if (result == RejoinResult::Failed) {
+                        sendAlert(DiscordEvent::Failing, L"Rejoin failed after 3 tries. The macro is paused.");
+                        gEnabled.store(false);
+                    }
+                } else {
+                    gEnabled.store(false);
+                }
+                phase = Phase::Cast;
+                phaseChangedAt = GetTickCount64();
+                lastDisconnectCheck = phaseChangedAt;
+                lastLoopMs = previousMs = PreciseMs(); // the time offline is not fishing time
+                PostMessage(gWindow, WM_TRACKER_UPDATE, 0, 0);
+                continue;
+            }
         }
 
         current.phase = phase;
@@ -3032,12 +3621,14 @@ enum HitId {
     kHitBaitCal0 = 50,                   // calibration: kHitBaitCal0 + 0..6
     kHitSessRow0 = 60,                   // session list rows: kHitSessRow0 + 0..6
     kHitSessPrev = 70, kHitSessNext, kHitSessBack, kHitSessDelete, kHitRestoreYes, kHitRestoreNo,
-    kHitMenu = 80, kHitMenuItem0,            // menu items: kHitMenuItem0 + 0..7
+    kHitMenu = 80, kHitMenuItem0,            // menu items: kHitMenuItem0 + 0..8
     kHitMenuBackdrop = 90, kHitResetStats, kHitDiscordToggle, kHitDiscordPing, kHitDiscordFail,
     kHitDiscordTest, kHitDiscordChip0 = 100, // rarity/ORE chips: kHitDiscordChip0 + 0..5
     kHitDiscordHide = 110,
     kHitRepoMode0 = 111, // reposition mode segments: kHitRepoMode0 + 0..2
     kHitCalAnchor = 115, kHitLearnWalk,
+    kHitRejoinToggle = 120, kHitRejoinSet0, // record a step: kHitRejoinSet0 + 0..2
+    kHitRejoinCam = 124, kHitRejoinWaitMinus, kHitRejoinWaitPlus, kHitRejoinTestCam, kHitRejoinTest,
 };
 struct HitRegion {
     RECT rect;
@@ -3296,7 +3887,12 @@ void DrawFishingTab(Gdiplus::Graphics& g, const Telemetry& t) {
     const wchar_t* headline = L"";
     Gdiplus::Color headColor = ui::kText;
     std::wstring detail;
-    if (t.learningWalk) {
+    if (gRejoinStage.load() > 0) {
+        const int stage = gRejoinStage.load();
+        headline = stage == 1 ? L"DISCONNECTED" : L"REJOINING";
+        headColor = stage == 1 ? ui::kBad : ui::kWarn;
+        detail = RejoinStageText(stage);
+    } else if (t.learningWalk) {
         headline = L"LEARNING STEPS";
         headColor = ui::kWarn;
         detail = L"Tapping W/A/S/D to learn the walk-back steps";
@@ -4000,6 +4596,101 @@ void DrawDiscordTab(Gdiplus::Graphics& g) {
     Text(g, line, gFontSmall, bad && status != 0 ? ui::kBad : ui::kSoft, RectF(178, 550, 184, 40));
 }
 
+// Rejoin page: the switch, the three recorded menu clicks, the camera
+// recording, the load wait and two test buttons.
+bool gCamRecording = false;                 // UI thread: recording the camera (raw mouse input)
+bool gCamRecRightDown = false;
+int gCamRecDx = 0, gCamRecDy = 0, gCamRecWheel = 0;
+
+void DrawRejoinTab(Gdiplus::Graphics& g) {
+    wchar_t line[160];
+    const bool ready = RejoinReady();
+    const int stage = gRejoinStage.load();
+    const bool recording = gCalibrating.load() && gCalibrationTarget == CalibrationTarget::RejoinPoint;
+
+    DrawCard(g, RectF(18, 128, 344, 96));
+    RowLabel(g, 134, L"Auto rejoin", L"needs the set-spawn gamepass");
+    DrawToggle(g, 134, gAutoRejoin.load() && ready, kHitRejoinToggle);
+    Divider(g, 178);
+    Gdiplus::Color statusColor = ui::kSoft;
+    if (stage > 0) {
+        swprintf_s(line, L"%ls", RejoinStageText(stage));
+        statusColor = ui::kWarn;
+    } else if (recording) {
+        swprintf_s(line, L"CLICK \"%ls\" in the game (Esc cancels)", kRejoinStepNames[gRejoinCalibIndex]);
+        statusColor = ui::kWarn;
+    } else if (gCamRecording) {
+        swprintf_s(line, L"Set your camera now, then click Done");
+        statusColor = ui::kWarn;
+    } else if (!ready) {
+        swprintf_s(line, L"Record the 3 steps below first");
+        statusColor = ui::kBad;
+    } else if (gAutoRejoin.load()) {
+        swprintf_s(line, L"Ready · rejoins by itself after a disconnect");
+        statusColor = ui::kGradA;
+    } else {
+        swprintf_s(line, L"Off · a disconnect only pauses + Discord alert");
+    }
+    Text(g, line, gFontBody, statusColor, RectF(34, 183, 312, 18));
+    Text(g, L"Reconnect → Play → slot → hold Join → camera → fish", gFontSmall, ui::kMuted,
+         RectF(34, 202, 312, 15));
+
+    // --- The three menu clicks --------------------------------------------------
+    DrawCard(g, RectF(18, 234, 344, 124));
+    Text(g, L"MENU STEPS", gFontLabel, ui::kText, RectF(34, 240, 120, 16));
+    Text(g, L"press Set, then click it in the game", gFontSmall, ui::kMuted, RectF(140, 240, 206, 16),
+         Gdiplus::StringAlignmentFar);
+    for (int i = 0; i < kRejoinSteps; ++i) {
+        const float y = 262.0f + i * 30.0f;
+        const bool active = stage == 2 + i;
+        swprintf_s(line, L"%d", i + 1);
+        Text(g, line, gFontLabel, active ? ui::kGradA : ui::kMuted, RectF(32, y, 14, 26));
+        Text(g, kRejoinStepNames[i], gFontBody, active ? ui::kGradA : ui::kText, RectF(48, y, 140, 26));
+        const bool set = RejoinStepSet(i);
+        const POINT rp = GetRejoinPoint(i);
+        if (!set) swprintf_s(line, L"not set");
+        else if (i == 2) swprintf_s(line, L"(%ld, %ld) · %.1fs", rp.x, rp.y, gRejoinHoldMs.load() / 1000.0);
+        else swprintf_s(line, L"(%ld, %ld)", rp.x, rp.y);
+        Text(g, line, gFontSmall, set ? ui::kMuted : ui::kBad, RectF(178, y, 110, 26));
+        const RectF button(292, y + 2, 56, 22);
+        if (recording && gRejoinCalibIndex == i) InsetButton(g, button, L"...", kHitRejoinSet0 + i, ui::kWarn, 11.0f);
+        else InsetButton(g, button, L"Set", kHitRejoinSet0 + i, ui::kSoft, 11.0f);
+    }
+
+    // --- Camera -----------------------------------------------------------------------
+    DrawCard(g, RectF(18, 368, 344, 60));
+    if (gCamRecording) {
+        swprintf_s(line, L"drag %d, %d · scroll %d", gCamRecDx, gCamRecDy, gCamRecWheel / WHEEL_DELTA);
+    } else if (gRejoinCamSet.load()) {
+        swprintf_s(line, L"drag %d, %d · scroll %d", gRejoinCamDx.load(), gRejoinCamDy.load(),
+                   gRejoinCamWheel.load());
+    } else {
+        swprintf_s(line, L"not recorded · camera stays default");
+    }
+    RowLabel(g, 378, L"Camera", line, gCamRecording ? ui::kWarn : (gRejoinCamSet.load() ? ui::kMuted : ui::kWarn));
+    if (gCamRecording) GradientButton(g, RectF(236, 380, 110, 36), L"Done", kHitRejoinCam);
+    else InsetButton(g, RectF(236, 380, 110, 36), L"Record", kHitRejoinCam, ui::kSoft);
+
+    // --- Load wait --------------------------------------------------------------------
+    DrawCard(g, RectF(18, 438, 344, 52));
+    RowLabel(g, 444, L"Load wait", L"seconds after Join before fishing");
+    InsetButton(g, RectF(236, 449, 30, 30), L"−", kHitRejoinWaitMinus, ui::kSoft, 9.0f);
+    swprintf_s(line, L"%d", gRejoinLoadWaitSec.load());
+    TextCenter(g, line, gFontRow, ui::kText, RectF(268, 449, 46, 30));
+    InsetButton(g, RectF(316, 449, 30, 30), L"+", kHitRejoinWaitPlus, ui::kSoft, 9.0f);
+
+    // --- Tests ------------------------------------------------------------------------
+    const bool testing = gRejoinTesting.load();
+    InsetButton(g, RectF(18, 502, 168, 40), L"Test camera", kHitRejoinTestCam,
+                gRejoinCamSet.load() && !testing ? ui::kSoft : ui::kMuted);
+    InsetButton(g, RectF(194, 502, 168, 40), testing ? L"Stop test" : L"Test menu steps", kHitRejoinTest,
+                testing ? ui::kBad : (ready ? ui::kSoft : ui::kMuted));
+    Text(g, L"Tests only run while paused. Camera: stand freshly spawned first.", gFontSmall, ui::kMuted,
+         RectF(22, 548, 340, 15));
+    Text(g, L"Menu steps: be on the game's PLAY screen first.", gFontSmall, ui::kMuted,
+         RectF(22, 564, 340, 15));
+}
+
 // Credits page.
 void DrawCreditsTab(Gdiplus::Graphics& g) {
     DrawCard(g, RectF(18, 128, 344, 460));
@@ -4032,17 +4723,18 @@ void DrawCreditsTab(Gdiplus::Graphics& g) {
 }
 
 // Burger menu: pages in menu order -> page index used by gActiveTab.
-const wchar_t* const kPageNames[8] = {L"Fishing", L"Settings", L"Hotkeys", L"Setup",
-                                      L"Auto Bait", L"Sessions", L"Discord Webhook", L"Credits"};
-const int kMenuOrder[8] = {0, 5, 1, 2, 3, 4, 6, 7};
+constexpr int kPageCount = 9;
+const wchar_t* const kPageNames[kPageCount] = {L"Fishing", L"Settings", L"Hotkeys", L"Setup", L"Auto Bait",
+                                               L"Sessions", L"Discord Webhook", L"Credits", L"Auto Rejoin"};
+const int kMenuOrder[kPageCount] = {0, 5, 1, 2, 3, 8, 4, 6, 7};
 
 void DrawMenu(Gdiplus::Graphics& g) {
     Gdiplus::SolidBrush dim(Gdiplus::Color(140, 18, 19, 36));
     g.FillRectangle(&dim, RectF(0, 114, static_cast<float>(ui::kWidth), static_cast<float>(ui::kHeight) - 114));
-    const RectF card(22, 118, 210, 8 * 38 + 10);
+    const RectF card(22, 118, 210, kPageCount * 38 + 10);
     DrawCard(g, card, 14.0f);
     std::vector<HitRegion> hits;
-    for (int k = 0; k < 8; ++k) {
+    for (int k = 0; k < kPageCount; ++k) {
         const int page = kMenuOrder[k];
         const RectF item(28, 123.0f + k * 38.0f, 198, 34);
         const int id = kHitMenuItem0 + k;
@@ -4120,7 +4812,7 @@ void PaintHud(HWND hwnd) {
                 g.DrawLine(&bars, 34.0f, y, 52.0f, y);
             }
             AddHit(burger, kHitMenu);
-            Text(g, kPageNames[std::clamp(gActiveTab, 0, 7)], gFontButton, ui::kText, RectF(74, 76, 200, 34));
+            Text(g, kPageNames[std::clamp(gActiveTab, 0, kPageCount - 1)], gFontButton, ui::kText, RectF(74, 76, 200, 34));
         }
 
         if (gActiveTab == 0) DrawFishingTab(g, t);
@@ -4130,6 +4822,7 @@ void PaintHud(HWND hwnd) {
         else if (gActiveTab == 4) DrawBaitTab(g);
         else if (gActiveTab == 5) DrawSessionsTab(g);
         else if (gActiveTab == 6) DrawDiscordTab(g);
+        else if (gActiveTab == 8) DrawRejoinTab(g);
         else DrawCreditsTab(g);
         if (gActiveTab == 0 && gRestorePromptId >= 0) DrawRestorePrompt(g);
         if (gMenuOpen) DrawMenu(g);
@@ -4193,6 +4886,11 @@ void ToggleTracker() {
 }
 
 RECT gPendingAnchor{0, 0, 0, 0}; // anchor box just dragged (reference captured in WindowProc)
+// Rejoin step just clicked (stored in WindowProc): spot, picture around it, hold time.
+POINT gRejoinPendingPoint{};
+std::vector<uint32_t> gRejoinPendingPixels;
+ULONGLONG gRejoinPendingDownAt = 0;
+int gRejoinPendingHoldMs = 0;
 
 // While calibrating, a low-level mouse hook swallows left-button input and
 // reports it back to the window (via WM_CALIBRATION_DONE) instead of
@@ -4212,6 +4910,29 @@ LRESULT CALLBACK CalibrationMouseProc(int code, WPARAM wParam, LPARAM lParam) {
         return CallNextHookEx(nullptr, code, wParam, lParam);
     }
     const POINT pt{info->pt.x, info->pt.y};
+
+    if (gCalibrationTarget == CalibrationTarget::RejoinPoint) {
+        // The click goes through to the game: recording the three steps is
+        // just joining once the normal way. Clicks on the macro's own window
+        // (e.g. to cancel) are not a step.
+        if (const HWND under = WindowFromPoint(pt)) {
+            if (GetAncestor(under, GA_ROOT) == gWindow) return CallNextHookEx(nullptr, code, wParam, lParam);
+        }
+        if (wParam == WM_LBUTTONDOWN) {
+            gRejoinPendingPoint = pt;
+            if (!GrabRejoinWindow(pt, gRejoinPendingPixels)) gRejoinPendingPixels.clear();
+            gRejoinPendingDownAt = GetTickCount64();
+            gDragging = true;
+            if (gRejoinCalibIndex != 2) PostMessage(gWindow, WM_CALIBRATION_DONE, 0, 0);
+        } else if (gDragging) {
+            gDragging = false;
+            if (gRejoinCalibIndex == 2) {      // Join is held: remember for how long
+                gRejoinPendingHoldMs = static_cast<int>(GetTickCount64() - gRejoinPendingDownAt);
+                PostMessage(gWindow, WM_CALIBRATION_DONE, 0, 0);
+            }
+        }
+        return CallNextHookEx(nullptr, code, wParam, lParam);
+    }
 
     if (gCalibrationTarget == CalibrationTarget::BaitPoint) {
         if (wParam != WM_LBUTTONDOWN) return CallNextHookEx(nullptr, code, wParam, lParam);
@@ -4383,6 +5104,22 @@ void LoadSettings() {
         gWalkLagMs = std::clamp(ReadIntSetting(L"Reposition", L"LagMs", 0, path), -60, 120);
         gWalkLearned = learned && !gAnchorEdges.empty();
     }
+    {
+        const wchar_t* names[kRejoinSteps] = {L"Play", L"Slot", L"Join"};
+        for (int i = 0; i < kRejoinSteps; ++i) {
+            wchar_t kx[16], ky[16];
+            swprintf_s(kx, L"%lsX", names[i]);
+            swprintf_s(ky, L"%lsY", names[i]);
+            LoadRejoinStep(i, POINT{ReadIntSetting(L"Rejoin", kx, 0, path), ReadIntSetting(L"Rejoin", ky, 0, path)});
+        }
+        gRejoinHoldMs.store(std::clamp(ReadIntSetting(L"Rejoin", L"JoinHoldMs", 3000, path), 500, 15000));
+        gRejoinLoadWaitSec.store(std::clamp(ReadIntSetting(L"Rejoin", L"LoadWaitSec", 20, path), 5, 120));
+        gRejoinCamSet.store(ReadIntSetting(L"Rejoin", L"CamSet", 0, path) != 0);
+        gRejoinCamDx.store(ReadIntSetting(L"Rejoin", L"CamDx", 0, path));
+        gRejoinCamDy.store(ReadIntSetting(L"Rejoin", L"CamDy", 0, path));
+        gRejoinCamWheel.store(ReadIntSetting(L"Rejoin", L"CamWheel", 0, path));
+        gAutoRejoin.store(ReadIntSetting(L"Rejoin", L"Enabled", 0, path) != 0 && RejoinReady());
+    }
     gRespawnEveryCatches.store(std::clamp<int>(
         ReadIntSetting(L"Fishing", L"RespawnEveryCatches", kDefaultRespawnEveryCatches, path),
         kMinRespawnEveryCatches, kMaxRespawnEveryCatches));
@@ -4502,6 +5239,24 @@ void SaveSettings() {
             WriteIntSetting(L"Reposition", kx, static_cast<int>(std::lround(gWalkSteps[k].x * 100)), path);
             WriteIntSetting(L"Reposition", ky, static_cast<int>(std::lround(gWalkSteps[k].y * 100)), path);
         }
+    }
+    {
+        const wchar_t* names[kRejoinSteps] = {L"Play", L"Slot", L"Join"};
+        WriteIntSetting(L"Rejoin", L"Enabled", gAutoRejoin.load() ? 1 : 0, path);
+        for (int i = 0; i < kRejoinSteps; ++i) {
+            wchar_t kx[16], ky[16];
+            swprintf_s(kx, L"%lsX", names[i]);
+            swprintf_s(ky, L"%lsY", names[i]);
+            const POINT rp = GetRejoinPoint(i);
+            WriteIntSetting(L"Rejoin", kx, rp.x, path);
+            WriteIntSetting(L"Rejoin", ky, rp.y, path);
+        }
+        WriteIntSetting(L"Rejoin", L"JoinHoldMs", gRejoinHoldMs.load(), path);
+        WriteIntSetting(L"Rejoin", L"LoadWaitSec", gRejoinLoadWaitSec.load(), path);
+        WriteIntSetting(L"Rejoin", L"CamSet", gRejoinCamSet.load() ? 1 : 0, path);
+        WriteIntSetting(L"Rejoin", L"CamDx", gRejoinCamDx.load(), path);
+        WriteIntSetting(L"Rejoin", L"CamDy", gRejoinCamDy.load(), path);
+        WriteIntSetting(L"Rejoin", L"CamWheel", gRejoinCamWheel.load(), path);
     }
     WriteIntSetting(L"Fishing", L"RespawnEveryCatches", gRespawnEveryCatches.load(), path);
     WriteIntSetting(L"Fishing", L"CollectDelayMs", static_cast<int>(gCollectDelayMs.load()), path);
@@ -4735,6 +5490,30 @@ void UpdateRespawnEverySetting() {
     SaveSettings();
 }
 
+// Camera recording: raw mouse input while the user sets the camera - the
+// same units Roblox turns the camera with and SendInput sends back later.
+// Only movement with the right button down counts, plus the wheel.
+void StartCameraRecording() {
+    RAWINPUTDEVICE device{0x01, 0x02, RIDEV_INPUTSINK, gWindow}; // generic mouse
+    if (!RegisterRawInputDevices(&device, 1, sizeof(device))) return;
+    gCamRecDx = gCamRecDy = gCamRecWheel = 0;
+    gCamRecRightDown = false;
+    gCamRecording = true;
+}
+
+void StopCameraRecording(bool keep) {
+    RAWINPUTDEVICE device{0x01, 0x02, RIDEV_REMOVE, nullptr};
+    RegisterRawInputDevices(&device, 1, sizeof(device));
+    gCamRecording = false;
+    if (!keep) return;
+    const int notches = gCamRecWheel / WHEEL_DELTA;
+    gRejoinCamDx.store(gCamRecDx);
+    gRejoinCamDy.store(gCamRecDy);
+    gRejoinCamWheel.store(notches);
+    gRejoinCamSet.store(gCamRecDx != 0 || gCamRecDy != 0 || notches != 0);
+    SaveSettings();
+}
+
 void HandleHit(HWND hwnd, int id) {
     if (id != kHitResetStats) gResetArmed = false;
     switch (id) {
@@ -4747,7 +5526,8 @@ void HandleHit(HWND hwnd, int id) {
             SetActiveTab(gActiveTab);
             break;
         case kHitMenuItem0: case kHitMenuItem0 + 1: case kHitMenuItem0 + 2: case kHitMenuItem0 + 3:
-        case kHitMenuItem0 + 4: case kHitMenuItem0 + 5: case kHitMenuItem0 + 6: case kHitMenuItem0 + 7: {
+        case kHitMenuItem0 + 4: case kHitMenuItem0 + 5: case kHitMenuItem0 + 6: case kHitMenuItem0 + 7:
+        case kHitMenuItem0 + 8: {
             const int page = kMenuOrder[id - kHitMenuItem0];
             gMenuOpen = false;
             gSessionDeleteArmed = false;
@@ -4844,6 +5624,37 @@ void HandleHit(HWND hwnd, int id) {
             gRepositionMode.store(id - kHitRepoMode0);
             gAutoRespawn.store(gRepositionMode.load() == 1);
             SaveSettings();
+            break;
+        case kHitRejoinToggle:
+            if (RejoinReady()) {
+                gAutoRejoin.store(!gAutoRejoin.load());
+                SaveSettings();
+            }
+            break;
+        case kHitRejoinSet0: case kHitRejoinSet0 + 1: case kHitRejoinSet0 + 2:
+            if (gCalibrating.load() && gCalibrationTarget == CalibrationTarget::RejoinPoint &&
+                gRejoinCalibIndex == id - kHitRejoinSet0) {
+                EndCalibration();
+            } else if (!gCalibrating.load() && !gCamRecording) {
+                gRejoinCalibIndex = id - kHitRejoinSet0;
+                StartCalibration(CalibrationTarget::RejoinPoint);
+            }
+            break;
+        case kHitRejoinCam:
+            if (gCamRecording) StopCameraRecording(true);
+            else if (!gCalibrating.load()) StartCameraRecording();
+            break;
+        case kHitRejoinWaitMinus:
+        case kHitRejoinWaitPlus:
+            gRejoinLoadWaitSec.store(std::clamp(gRejoinLoadWaitSec.load() + (id == kHitRejoinWaitPlus ? 5 : -5), 5, 120));
+            SaveSettings();
+            break;
+        case kHitRejoinTestCam:
+            if (!gEnabled.load() && !gRejoinTesting.load() && gRejoinCamSet.load()) gRejoinTestRequest.store(1);
+            break;
+        case kHitRejoinTest:
+            if (gRejoinTesting.load()) gRejoinTesting.store(false); // stops the running test
+            else if (!gEnabled.load() && RejoinReady()) gRejoinTestRequest.store(2);
             break;
         case kHitCalAnchor:
             if (gCalibrating.load() && gCalibrationTarget == CalibrationTarget::AnchorRegion) EndCalibration();
@@ -5132,6 +5943,18 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
             // calibrating the bar/exit regions would be an unwanted extra cast.
             const CalibrationTarget justCalibrated = gCalibrationTarget;
             EndCalibration();
+            if (justCalibrated == CalibrationTarget::RejoinPoint) {
+                SetRejoinStep(gRejoinCalibIndex, gRejoinPendingPoint, gRejoinPendingPixels, true);
+                if (gRejoinCalibIndex == 2) {
+                    gRejoinHoldMs.store(std::clamp(gRejoinPendingHoldMs, 500, 15000));
+                }
+                SaveSettings();
+                if (gRejoinCalibIndex < kRejoinSteps - 1) { // straight on to the next button
+                    ++gRejoinCalibIndex;
+                    StartCalibration(CalibrationTarget::RejoinPoint);
+                }
+                return 0;
+            }
             if (justCalibrated == CalibrationTarget::AnchorRegion) {
                 // Store the reference image, then learn the W/A/S/D steps.
                 Sleep(150); // let the selection overlay/cursor settle
@@ -5164,6 +5987,28 @@ LRESULT CALLBACK WindowProc(HWND hwnd, UINT message, WPARAM wParam, LPARAM lPara
         case WM_TRACKER_UPDATE:
             InvalidateRect(hwnd, nullptr, FALSE);
             return 0;
+        case WM_INPUT:
+            if (gCamRecording) {
+                RAWINPUT raw{};
+                UINT size = sizeof(raw);
+                if (GetRawInputData(reinterpret_cast<HRAWINPUT>(lParam), RID_INPUT, &raw, &size,
+                                    sizeof(RAWINPUTHEADER)) != static_cast<UINT>(-1) &&
+                    raw.header.dwType == RIM_TYPEMOUSE) {
+                    const RAWMOUSE& mouse = raw.data.mouse;
+                    if (mouse.usButtonFlags & RI_MOUSE_RIGHT_BUTTON_DOWN) gCamRecRightDown = true;
+                    if (mouse.usButtonFlags & RI_MOUSE_RIGHT_BUTTON_UP) gCamRecRightDown = false;
+                    if (gCamRecRightDown && !(mouse.usFlags & MOUSE_MOVE_ABSOLUTE)) {
+                        gCamRecDx += mouse.lLastX;
+                        gCamRecDy += mouse.lLastY;
+                    }
+                    if (mouse.usButtonFlags & RI_MOUSE_WHEEL) {
+                        gCamRecWheel += static_cast<short>(mouse.usButtonData);
+                        InvalidateRect(hwnd, nullptr, FALSE);
+                    }
+                    if (mouse.usButtonFlags & RI_MOUSE_RIGHT_BUTTON_UP) InvalidateRect(hwnd, nullptr, FALSE);
+                }
+            }
+            break; // DefWindowProc cleans up
         case WM_PAINT:
             PaintHud(hwnd);
             return 0;
